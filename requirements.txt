@@ -1,0 +1,7 @@
+boto3
+langchain
+langchain-aws
+langgraph
+pydantic
+xai-sdk
+dotenv
