@@ -1,7 +1,10 @@
 boto3
 langchain
 langchain-aws
+langchain-openai
 langgraph
 pydantic
 xai-sdk
 dotenv
+duckduckgo-search
+langchain-xai
