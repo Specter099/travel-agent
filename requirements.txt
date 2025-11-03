@@ -6,5 +6,6 @@ langgraph
 pydantic
 xai-sdk
 dotenv
-duckduckgo-search
+ddgs
 langchain-xai
+requests
