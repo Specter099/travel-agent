@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage
 from credentials import CredentialsManager
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict
+import json
 
 model = "grok-4-fast"
 
@@ -29,7 +30,7 @@ class AgentState(TypedDict):
     user_query: str
     agent_response: str
 
-class AgentResponse(BaseModel):
+class AgentResponseFormat(BaseModel):
     response: str
 
 def web_search(query: str, max_results: int = 5) -> str:
@@ -49,16 +50,18 @@ class AgentWorkflow:
     def __init__(self):
         self.workflow = self.create_workflow()
 
-    def web_search_agent(self, model: str):
-        travel_agent = create_agent(
+    def _create_agent(self, model: str, tools, response_format):
+        return create_agent(
             model=model,
-            tools=[web_search],
-            response_format=AgentResponse
+            tools=tools if tools is not None else None,
+            response_format=response_format
         )
-        return travel_agent
+
+    def web_search_agent(self):
+        return self._create_agent("grok-4-fast", [web_search], AgentResponseFormat)
     
     def web_search_node(self, state: AgentState):
-        agent = self.web_search_agent(model)
+        agent = self.web_search_agent()
         agent_response = agent.invoke({"messages": [{"role": "user", "content": state["user_query"]}]}
         )
         return {"agent_response": agent_response}
@@ -75,10 +78,13 @@ class AgentWorkflow:
         return result
     
 if __name__=='__main__':
+    user_query = "Provide hotel recommendations in Donegal, Ireland."
     role_arn, secret_name = load_credentials()
     os.environ["AWS_ROLE_ARN"] = role_arn
     os.environ["XAI_SECRET_NAME"] = secret_name
     api_key = get_credentials(role_arn, secret_name) 
     os.environ["XAI_API_KEY"] = api_key
     workflow = AgentWorkflow()
-    print(workflow.run({"user_query": "Provide hotel recommendations in Donegal, Ireland."}))
+    response = workflow.run({"user_query": user_query})
+    agent_response = json.loads(response["agent_response"]["messages"][1].content)
+    print(agent_response['response'])
