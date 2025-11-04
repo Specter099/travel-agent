@@ -121,15 +121,12 @@ class AgentWorkflow:
 
     def flight_recommendations_node(self, state: AgentState):
         user_query = state["user_query"]
-        llm = self._create_grok_llm(streaming=False)
         
-        # Create prompt to determine if flight info is needed
-        prompt = f"""Determine if the user is asking for flight recommendations based on the query. Respond only with True or False.
-        Query: {user_query}"""
-
-        # Get structured response from LLM
-        response = llm.invoke([HumanMessage(content=prompt)])
-        needs_flights = response.content.strip().lower() == "true"
+        # Check if flight details are provided in the state or if query mentions flights
+        has_flight_details = bool(state.get("flight_origin") or state.get("flight_destination"))
+        query_mentions_flights = "flight" in user_query.lower() or "fly" in user_query.lower()
+        
+        needs_flights = has_flight_details or query_mentions_flights
         return {"flight_recommendations": needs_flights}
 
     def first_node(self, state: AgentState):
@@ -159,10 +156,18 @@ class AgentWorkflow:
                 value = value.strip()
                 extracted[key.strip().lower().replace(' ', '_')] = None if value == 'None' else value
 
+        # Safely convert max_price to float with error handling
+        max_price = None
+        if extracted.get('max_price'):
+            try:
+                max_price = float(extracted['max_price'])
+            except (ValueError, TypeError):
+                max_price = None
+        
         return {
             "flight_origin": extracted.get('origin'),
             "flight_destination": extracted.get('destination'),
-            "flight_max_price": float(extracted['max_price']) if extracted.get('max_price') else None,
+            "flight_max_price": max_price,
             "flight_departure_date": extracted.get('departure_date'),
             "flight_arrival_date": extracted.get('arrival_date')
         }
