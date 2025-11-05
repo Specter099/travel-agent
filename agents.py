@@ -28,8 +28,9 @@ def load_credentials():
 
 class AgentState(TypedDict):
     user_query: str
+    should_recommend_hotels: bool
     web_search_agent_response: Optional[str]
-    flight_recommendations: bool
+    should_recommend_flights: bool
     flight_search_agent_response: Optional[str]
     flight_origin: Optional[str]
     flight_destination: Optional[str]
@@ -96,14 +97,7 @@ class AgentWorkflow:
         self.memory = MemorySaver()
         self.workflow = self.create_workflow()
 
-    def _create_agent(self, model: str, tools, response_format):
-        return create_agent(
-            model=model,
-            tools=tools if tools is not None else None,
-            response_format=response_format
-        )
-
-    def _create_grok_llm(self, streaming=None):
+    def create_grok_llm(self, streaming=None):
         return ChatOpenAI(
             model=self.model,
             api_key=os.environ["XAI_API_KEY"],
@@ -111,7 +105,7 @@ class AgentWorkflow:
             streaming=streaming
         )
     
-    def _stream_response(self, llm: ChatOpenAI, prompt: str) -> str:
+    def stream_response(self, llm: ChatOpenAI, prompt: str) -> str:
         # Stream the response
         response_chunks = []
         for chunk in llm.stream(prompt):
@@ -122,19 +116,9 @@ class AgentWorkflow:
         full_response = "".join(response_chunks)
         return full_response
 
-    def flight_recommendations_node(self, state: AgentState):
+    def entry_node(self, state: AgentState):
         user_query = state["user_query"]
-        
-        # Check if flight details are provided in the state or if query mentions flights
-        has_flight_details = bool(state.get("flight_origin") or state.get("flight_destination"))
-        query_mentions_flights = "flight" in user_query.lower() or "fly" in user_query.lower()
-        
-        needs_flights = has_flight_details or query_mentions_flights
-        return {"flight_recommendations": needs_flights}
-
-    def first_node(self, state: AgentState):
-        user_query = state["user_query"]
-        llm = self._create_grok_llm(streaming=False)
+        llm = self.create_grok_llm(streaming=False)
         
         # Create prompt to extract flight details
         prompt = f"""Extract flight details from the following query. If any detail is not present, return None.
@@ -145,7 +129,9 @@ class AgentWorkflow:
         Destination: <destination airport code or None> 
         Max Price: <maximum price as float or None>
         Departure Date: <YYYY-MM-DD or None>
-        Arrival Date: <YYYY-MM-DD or None>"""
+        Arrival Date: <YYYY-MM-DD or None>
+        Should recommend flights: <True or False>
+        Should recommend hotels: <True or False>"""
 
         # Get structured response from LLM
         response = llm.invoke([HumanMessage(content=prompt)])
@@ -166,22 +152,56 @@ class AgentWorkflow:
                 max_price = float(extracted['max_price'])
             except (ValueError, TypeError):
                 max_price = None
-        
+
         return {
             "flight_origin": extracted.get('origin'),
             "flight_destination": extracted.get('destination'),
             "flight_max_price": max_price,
             "flight_departure_date": extracted.get('departure_date'),
-            "flight_arrival_date": extracted.get('arrival_date')
+            "flight_arrival_date": extracted.get('arrival_date'),
+            "should_recommend_flights": extracted.get('should_recommend_flights') == 'True',
+            "should_recommend_hotels": extracted.get('should_recommend_hotels') == 'True'
         }
+
+    def print_state_node(self, state: AgentState):
+        print(state.get("flight_origin"))
+        print(state.get("flight_destination"))
+        print(state.get("flight_max_price"))
+        print(state.get("flight_departure_date"))
+        print(state.get("flight_arrival_date"))
+        print(state.get("should_recommend_hotels"))
+        print(state.get("should_recommend_flights"))
+
+    def flight_recommendations_node(self, state: AgentState):
+        user_query = state["user_query"]
         
+        # Check if flight details are provided in the state or if query mentions flights
+        has_flight_details = bool(state.get("flight_origin") or state.get("flight_destination"))
+        query_mentions_flights = "flight" in user_query.lower() or "fly" in user_query.lower()
+        
+        needs_flights = has_flight_details or query_mentions_flights
+        return {"flight_recommendations": needs_flights}
+
+    def should_recommend_hotels_node(self, state: AgentState):
+        user_query = state.get("user_query")
+        llm = self.create_grok_llm(streaming=False)
+        prompt = f"""You are a helpful travel agent.  Determine if the user is asking for hotel recommendations.  ***Respond with only True or False***.
+
+user_query: {user_query}
+"""
+        should_recommend_hotels_response = llm.invoke([HumanMessage(content=prompt)]).content.lower()
+        if should_recommend_hotels_response == "true":
+            response = True
+        if should_recommend_hotels_response == "false":
+            response = False
+        return {"should_recommend_hotels": response}
 
     def web_search_node(self, state: AgentState):
         # Perform web search first
         search_results = web_search(state["user_query"])
         
         # Create streaming LLM
-        llm = self._create_grok_llm(streaming=True)
+        llm = self.create_grok_llm(streaming=True)
         
         # Build context from messages
         history_context = ""
@@ -202,7 +222,7 @@ Search Results:
 Please provide a helpful response with specific hotel recommendations."""
         
         # Stream the response
-        full_response = self._stream_response(llm, prompt)
+        full_response = self.stream_response(llm, prompt)
         
         # Append AI response to messages
         new_messages = messages + [AIMessage(content=full_response)]
@@ -218,7 +238,7 @@ Please provide a helpful response with specific hotel recommendations."""
         flight_max_price = state.get('flight_max_price', 1000)
 
         # Create streaming LLM
-        llm = self._create_grok_llm(streaming=True)
+        llm = self.create_grok_llm(streaming=True)
 
         # Build context from messages
         history_context = ""
@@ -244,7 +264,7 @@ Since specific flight data is not available, provide general flight booking advi
 - Airport recommendations"""
 
         # Stream the response
-        full_response = self._stream_response(llm, prompt)
+        full_response = self.stream_response(llm, prompt)
         
         # Append AI response to messages
         new_messages = messages + [AIMessage(content=full_response)]
@@ -254,30 +274,71 @@ Since specific flight data is not available, provide general flight booking advi
             "messages": new_messages
         }  
       
-    def should_search_flights(self, state: AgentState):
-        """Conditional function to determine next node"""
-        if state.get("flight_recommendations"):
+    def conversational_node(self, state: AgentState):
+        llm = self.create_grok_llm(streaming=True)
+        messages = state.get("messages", [])
+        
+        history_context = ""
+        if len(messages) > 1:
+            history_context = "\n\nPrevious conversation:\n"
+            for msg in messages[-4:]:
+                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+                history_context += f"{role}: {msg.content}\n"
+        
+        prompt = f"""You are a helpful travel agent. Answer the user's query: {state["user_query"]}
+{history_context}
+
+Provide a helpful and friendly response."""
+        
+        full_response = self.stream_response(llm, prompt)
+        new_messages = messages + [AIMessage(content=full_response)]
+        
+        return {
+            "web_search_agent_response": full_response,
+            "messages": new_messages
+        }
+
+    def route_after_entry(self, state: AgentState):
+        if state.get("should_recommend_hotels"):
+            return "web_search_agent"
+        elif state.get("should_recommend_flights"):
+            return "flight_search_agent"
+        else:
+            return "conversational_node"
+
+    def route_after_hotels(self, state: AgentState):
+        if state.get("should_recommend_flights"):
             return "flight_search_agent"
         else:
             return END
-    
+
     def create_workflow(self):
         workflow = StateGraph(AgentState)
-        workflow.add_node("flight_recommendations_node", self.flight_recommendations_node)
+        workflow.add_node("entry_node", self.entry_node)
         workflow.add_node("web_search_agent", self.web_search_node)
         workflow.add_node("flight_search_agent", self.flight_search_node)
-        
-        workflow.add_edge(START, "flight_recommendations_node")
-        workflow.add_edge("flight_recommendations_node", "web_search_agent")
+        workflow.add_node("conversational_node", self.conversational_node)
+    
+        workflow.add_edge(START, "entry_node")
+        workflow.add_conditional_edges(
+            "entry_node",
+            self.route_after_entry,
+            {
+                "web_search_agent": "web_search_agent",
+                "flight_search_agent": "flight_search_agent",
+                "conversational_node": "conversational_node"
+            }
+        )
         workflow.add_conditional_edges(
             "web_search_agent",
-            self.should_search_flights,
+            self.route_after_hotels,
             {
                 "flight_search_agent": "flight_search_agent",
                 END: END
             }
         )
         workflow.add_edge("flight_search_agent", END)
+        workflow.add_edge("conversational_node", END)
         return workflow.compile(checkpointer=self.memory)
     
     def run(self, state: AgentState, thread_id: str = "default"):
@@ -305,8 +366,3 @@ if __name__=='__main__':
     workflow = AgentWorkflow("grok-4-fast")
     
     result = workflow.run_streaming({"user_query": user_query})
-    print(f"\n\nWeb Search Response: {result.get('web_search_agent_response', 'N/A')}")
-    if result.get('flight_search_agent_response', 'N/A') != 'N/A':
-        print(f"\n\nFlight Search Response: {result.get('flight_search_agent_response', 'N/A')}")
-    else:
-        print("\n\nFlight recommendations were not requested")
