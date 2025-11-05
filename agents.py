@@ -4,14 +4,13 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 import os
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from credentials import CredentialsManager
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict, Optional, Annotated
 from operator import add
 import requests
-import json
 
 def load_credentials():
     load_dotenv()
@@ -37,7 +36,7 @@ class AgentState(TypedDict):
     flight_max_price: Optional[float]
     flight_departure_date: Optional[str]
     flight_arrival_date: Optional[str]
-    conversation_history: Annotated[list, add]
+    messages: Annotated[list, add]
 
 class AgentResponseFormat(BaseModel):
     response: str
@@ -184,14 +183,18 @@ class AgentWorkflow:
         # Create streaming LLM
         llm = self._create_grok_llm(streaming=True)
         
-        # Build context from conversation history
+        # Build context from messages
         history_context = ""
-        if state.get("conversation_history"):
-            history_context = "\n\nPrevious conversation:\n" + "\n".join(state["conversation_history"][-6:])
+        messages = state.get("messages", [])
+        if len(messages) > 1:
+            history_context = "\n\nPrevious conversation:\n"
+            for msg in messages[-4:]:
+                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+                history_context += f"{role}: {msg.content}\n"
         
         # Create prompt with search results
         prompt = f"""Based on the following search results, provide hotel recommendations for the user's query: {state["user_query"]}
-    {history_context}
+{history_context}
         
 Search Results:
 {search_results}
@@ -201,9 +204,12 @@ Please provide a helpful response with specific hotel recommendations."""
         # Stream the response
         full_response = self._stream_response(llm, prompt)
         
+        # Append AI response to messages
+        new_messages = messages + [AIMessage(content=full_response)]
+        
         return {
             "web_search_agent_response": full_response,
-            "conversation_history": [f"User: {state['user_query']}", f"Assistant: {full_response}"]
+            "messages": new_messages
         }
 
     def flight_search_node(self, state: AgentState):
@@ -214,12 +220,16 @@ Please provide a helpful response with specific hotel recommendations."""
         # Create streaming LLM
         llm = self._create_grok_llm(streaming=True)
 
-        # Build context from conversation history
+        # Build context from messages
         history_context = ""
-        if state.get("conversation_history"):
-            history_context = "\n\nPrevious conversation:\n" + "\n".join(state["conversation_history"][-6:])
+        messages = state.get("messages", [])
+        if len(messages) > 1:
+            history_context = "\n\nPrevious conversation:\n"
+            for msg in messages[-4:]:
+                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+                history_context += f"{role}: {msg.content}\n"
 
-        # Provide general flight advice without API calls to avoid 404 errors
+        # Provide general flight advice
         prompt = f"""Provide flight recommendations for the user's query: {state["user_query"]}
 {history_context}
         
@@ -236,9 +246,12 @@ Since specific flight data is not available, provide general flight booking advi
         # Stream the response
         full_response = self._stream_response(llm, prompt)
         
+        # Append AI response to messages
+        new_messages = messages + [AIMessage(content=full_response)]
+        
         return {
             "flight_search_agent_response": full_response,
-            "conversation_history": [f"Flight search: {full_response}"]
+            "messages": new_messages
         }  
       
     def should_search_flights(self, state: AgentState):
