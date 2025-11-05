@@ -7,7 +7,9 @@ from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from credentials import CredentialsManager
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Optional
+from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict, Optional, Annotated
+from operator import add
 import requests
 import json
 
@@ -35,6 +37,7 @@ class AgentState(TypedDict):
     flight_max_price: Optional[float]
     flight_departure_date: Optional[str]
     flight_arrival_date: Optional[str]
+    conversation_history: Annotated[list, add]
 
 class AgentResponseFormat(BaseModel):
     response: str
@@ -90,8 +93,9 @@ def get_flight_destinations(access_token: str, origin: str, max_price: int = 200
 class AgentWorkflow:
 
     def __init__(self, model: str):
-        self.workflow = self.create_workflow()
         self.model = model
+        self.memory = MemorySaver()
+        self.workflow = self.create_workflow()
 
     def _create_agent(self, model: str, tools, response_format):
         return create_agent(
@@ -180,9 +184,14 @@ class AgentWorkflow:
         # Create streaming LLM
         llm = self._create_grok_llm(streaming=True)
         
+        # Build context from conversation history
+        history_context = ""
+        if state.get("conversation_history"):
+            history_context = "\n\nPrevious conversation:\n" + "\n".join(state["conversation_history"][-6:])
+        
         # Create prompt with search results
         prompt = f"""Based on the following search results, provide hotel recommendations for the user's query: {state["user_query"]}
-    
+    {history_context}
         
 Search Results:
 {search_results}
@@ -191,7 +200,11 @@ Please provide a helpful response with specific hotel recommendations."""
         
         # Stream the response
         full_response = self._stream_response(llm, prompt)
-        return {"web_search_agent_response": full_response}
+        
+        return {
+            "web_search_agent_response": full_response,
+            "conversation_history": [f"User: {state['user_query']}", f"Assistant: {full_response}"]
+        }
 
     def flight_search_node(self, state: AgentState):
         flight_origin = state.get('flight_origin')
@@ -201,8 +214,14 @@ Please provide a helpful response with specific hotel recommendations."""
         # Create streaming LLM
         llm = self._create_grok_llm(streaming=True)
 
+        # Build context from conversation history
+        history_context = ""
+        if state.get("conversation_history"):
+            history_context = "\n\nPrevious conversation:\n" + "\n".join(state["conversation_history"][-6:])
+
         # Provide general flight advice without API calls to avoid 404 errors
         prompt = f"""Provide flight recommendations for the user's query: {state["user_query"]}
+{history_context}
         
 Origin: {flight_origin if flight_origin else 'Not specified'}
 Destination: {flight_destination if flight_destination else 'Not specified'} 
@@ -216,7 +235,11 @@ Since specific flight data is not available, provide general flight booking advi
 
         # Stream the response
         full_response = self._stream_response(llm, prompt)
-        return {"flight_search_agent_response": full_response}  
+        
+        return {
+            "flight_search_agent_response": full_response,
+            "conversation_history": [f"Flight search: {full_response}"]
+        }  
       
     def should_search_flights(self, state: AgentState):
         """Conditional function to determine next node"""
@@ -242,14 +265,16 @@ Since specific flight data is not available, provide general flight booking advi
             }
         )
         workflow.add_edge("flight_search_agent", END)
-        return workflow.compile()
+        return workflow.compile(checkpointer=self.memory)
     
-    def run(self, state: AgentState):
-        result = self.workflow.invoke(state)
+    def run(self, state: AgentState, thread_id: str = "default"):
+        config = {"configurable": {"thread_id": thread_id}}
+        result = self.workflow.invoke(state, config)
         return result
     
-    def run_streaming(self, state: AgentState):
-        result = self.workflow.invoke(state)
+    def run_streaming(self, state: AgentState, thread_id: str = "default"):
+        config = {"configurable": {"thread_id": thread_id}}
+        result = self.workflow.invoke(state, config)
         return result
     
 if __name__=='__main__':
