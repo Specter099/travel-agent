@@ -6,13 +6,17 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 # Initialize credentials
 def setup_credentials():
-    role_arn, secret_name = load_credentials()
-    os.environ["AWS_ROLE_ARN"] = role_arn
-    os.environ["XAI_SECRET_NAME"] = secret_name
-    x_api_key = get_credentials(role_arn, secret_name)
-    amadeus_credentials = get_amadeus_credentials(role_arn, "amadeus_api")
-    os.environ["XAI_API_KEY"] = x_api_key[0]
-    access_token = get_flight_search_credentials(amadeus_credentials[0], amadeus_credentials[1])
+    credentials = load_credentials()
+    if credentials:
+        os.environ["AWS_ROLE_ARN"] = credentials[0]
+    
+    role_arn = os.environ.get("AWS_ROLE_ARN")
+    api_keys = get_credentials(role_arn, "api_keys")
+    os.environ["XAI_API_KEY"] = api_keys[0]
+    os.environ["AMADEUS_API_KEY"] = api_keys[1]
+    os.environ["AMADEUS_API_SECRET"] = api_keys[2]
+    os.environ["LANGSMITH_API_KEY"] = api_keys[3]
+    access_token = get_flight_search_credentials(api_keys[1], api_keys[2])
     os.environ["AMADEUS_ACCESS_TOKEN"] = access_token
 
 # Initialize workflow

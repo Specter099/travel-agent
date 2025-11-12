@@ -17,13 +17,13 @@ def load_credentials():
 
     # Get configuration from environment variables
     role_arn = os.getenv("AWS_ROLE_ARN")
-    secret_name = os.getenv("XAI_SECRET_NAME")
+    secret_name = os.getenv("SECRET_NAME")
 
     # Validate required environment variables
     if not role_arn:
         raise ValueError("AWS_ROLE_ARN environment variable is required")
     if not secret_name:
-        raise ValueError("XAI_SECRET_NAME environment variable is required")
+        raise ValueError("SECRET_NAME environment variable is required")
     return role_arn, secret_name
 
 class AgentState(TypedDict):
@@ -74,8 +74,8 @@ def get_flight_search_credentials(client_id: str, client_secret: str):
 
 def get_credentials(role_arn: str, secret_name: str) -> str:
     creds_manager = CredentialsManager(role_arn)
-    api_key = creds_manager.get_secret(secret_name)
-    return api_key
+    api_keys = creds_manager.get_secret(secret_name)
+    return api_keys
 
 def get_flight_destinations(access_token: str, origin: str, max_price: int = 200):
     url = "https://test.api.amadeus.com/v1/shopping/flight-destinations"
@@ -163,15 +163,6 @@ class AgentWorkflow:
             "should_recommend_hotels": extracted.get('should_recommend_hotels') == 'True'
         }
 
-    def print_state_node(self, state: AgentState):
-        print(state.get("flight_origin"))
-        print(state.get("flight_destination"))
-        print(state.get("flight_max_price"))
-        print(state.get("flight_departure_date"))
-        print(state.get("flight_arrival_date"))
-        print(state.get("should_recommend_hotels"))
-        print(state.get("should_recommend_flights"))
-
     def flight_recommendations_node(self, state: AgentState):
         user_query = state["user_query"]
         
@@ -224,12 +215,8 @@ Please provide a helpful response with specific hotel recommendations."""
         # Stream the response
         full_response = self.stream_response(llm, prompt)
         
-        # Append AI response to messages
-        new_messages = messages + [AIMessage(content=full_response)]
-        
         return {
-            "web_search_agent_response": full_response,
-            "messages": new_messages
+            "web_search_agent_response": full_response
         }
 
     def flight_search_node(self, state: AgentState):
@@ -356,12 +343,13 @@ if __name__=='__main__':
     user_query = "Provide hotel and flight recommendations in Donegal, Ireland."
     role_arn, secret_name = load_credentials()
     os.environ["AWS_ROLE_ARN"] = role_arn
-    os.environ["XAI_SECRET_NAME"] = secret_name
-    x_api_key = get_credentials(role_arn, secret_name) 
-    amadeus_credentials = get_amadeus_credentials(role_arn, "amadeus_api")
-    os.environ["XAI_API_KEY"] = x_api_key[0]
-    access_token = get_flight_search_credentials(amadeus_credentials[0], amadeus_credentials[1])
-    os.environ["AMADEUS_ACCESS_TOKEN"] = access_token
+    os.environ["SECRET_NAME"] = secret_name
+    api_keys = get_credentials(role_arn, secret_name) 
+    os.environ["XAI_API_KEY"] = api_keys[0]
+    amadeus_access_key = api_keys[1]
+    amadeus_secret_key = api_keys[2]
+    os.environ["AMADEUS_ACCESS_KEY"] = amadeus_access_key
+    os.environ["AMADEUS_SECRET_KEY"] = amadeus_secret_key
     
     workflow = AgentWorkflow("grok-4-fast")
     

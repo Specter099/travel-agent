@@ -33,7 +33,7 @@ class CredentialsManager:
         
         response = client.get_secret_value(SecretId=secret_name)
         secret = json.loads(response['SecretString'])
-        return secret.get('api_key'), secret.get('api_secret')
+        return secret.get('x_api_key'), secret.get('amadeus_api_key'), secret.get('amadeus_api_secret'), secret.get('langsmith_api_key')
     
     def create_bedrock_client(self, region: str = 'us-east-1'):
         if not self.credentials:
