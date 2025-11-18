@@ -1,6 +1,7 @@
 import gradio as gr
 import os
 import time
+import threading
 from agents import AgentWorkflow, load_credentials, get_credentials, get_flight_search_credentials
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -27,11 +28,10 @@ def travel_agent_chat(message, history, origin, destination, max_price):
     if not message.strip():
         yield history, ""
         return
-    
+
     # Add user message to history
     history.append({"role": "user", "content": message})
-    #history.append({"role": "assistant", "content": ""})
-    
+
     # Build state from inputs
     # Note: messages uses the 'add' operator, so we only pass the new message
     # LangGraph will automatically append it to the existing messages in the checkpoint
@@ -47,31 +47,72 @@ def travel_agent_chat(message, history, origin, destination, max_price):
         "web_search_agent_response": None,
         "flight_search_agent_response": None
     }
-    
+
     # Debug: Show what flight details were captured
     if origin or destination:
         print(f"Flight details captured - Origin: {origin}, Destination: {destination}, Max Price: {max_price}")
-    
+
+    # Track current responses
+    hotel_response = {"content": ""}
+    flight_response = {"content": ""}
+    workflow_done = {"done": False}
+
+    # Setup streaming callback to capture LLM tokens
+    def streaming_callback(partial_response, response_type):
+        if response_type == "hotel":
+            hotel_response["content"] = partial_response
+        elif response_type == "flight":
+            flight_response["content"] = partial_response
+        elif response_type == "conversational":
+            hotel_response["content"] = partial_response  # Reuse for simple responses
+
+    workflow.streaming_callback = streaming_callback
+
     # Show initial loading message
     history[-1]["content"] = "🔍 Searching for recommendations..."
     yield history, ""
-    
-    # Run workflow with consistent thread_id
-    result = workflow.run_streaming(state, thread_id="gradio_session")
-    
-    # Format response
-    response = ""
-    if result.get('web_search_agent_response'):
-        response += f"🏨 **Hotel Recommendations:**\n{result['web_search_agent_response']}\n\n"
-        history[-1]["content"] = response
-        yield history, ""
-        time.sleep(0.1)  # Small delay for visual effect
-    
-    if result.get('flight_search_agent_response'):
-        response += f"✈️ **Flight Information:**\n{result['flight_search_agent_response']}"
-        history[-1]["content"] = response
-        yield history, ""
-    
+
+    # Run workflow in background thread
+    def run_workflow():
+        try:
+            for event in workflow.run_streaming(state, thread_id="gradio_session"):
+                pass  # Just consume events
+        finally:
+            workflow_done["done"] = True
+
+    workflow_thread = threading.Thread(target=run_workflow)
+    workflow_thread.start()
+
+    # Stream updates to Gradio while workflow runs
+    try:
+        last_hotel = ""
+        last_flight = ""
+
+        while not workflow_done["done"] or hotel_response["content"] != last_hotel or flight_response["content"] != last_flight:
+            current_hotel = hotel_response["content"]
+            current_flight = flight_response["content"]
+
+            # Update UI if content changed
+            if current_hotel != last_hotel or current_flight != last_flight:
+                if current_flight:
+                    if current_hotel:
+                        history[-1]["content"] = f"🏨 **Hotel Recommendations:**\n{current_hotel}\n\n✈️ **Flight Information:**\n{current_flight}"
+                    else:
+                        history[-1]["content"] = f"✈️ **Flight Information:**\n{current_flight}"
+                elif current_hotel:
+                    history[-1]["content"] = f"🏨 **Hotel Recommendations:**\n{current_hotel}"
+
+                yield history, ""
+                last_hotel = current_hotel
+                last_flight = current_flight
+
+            time.sleep(0.1)  # Check for updates every 100ms
+
+        workflow_thread.join()
+    finally:
+        workflow.streaming_callback = None
+
+    # Final yield to ensure last state is shown
     yield history, ""
 
 # Create Gradio interface
