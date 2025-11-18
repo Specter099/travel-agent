@@ -17,13 +17,16 @@ def load_credentials():
     # Get configuration from environment variables
     role_arn = os.getenv("AWS_ROLE_ARN")
     secret_name = os.getenv("SECRET_NAME")
+    external_id = os.getenv("EXTERNAL_ID")
 
     # Validate required environment variables
     if not role_arn:
         raise ValueError("AWS_ROLE_ARN environment variable is required")
     if not secret_name:
         raise ValueError("SECRET_NAME environment variable is required")
-    return role_arn, secret_name
+    if not external_id:
+        raise ValueError("EXTERNAL_ID environment variable is required")
+    return role_arn, secret_name, external_id
 
 class AgentState(TypedDict):
     user_query: str
@@ -49,8 +52,8 @@ def web_search(query: str, max_results: int = 5) -> str:
             results.append(f"{r['title']}: {r['body']} (URL: {r['href']})")
     return "\n".join(results)
 
-def get_amadeus_credentials(role_arn: str, secret_name: str) -> str:
-    creds_manager = CredentialsManager(role_arn)
+def get_amadeus_credentials(role_arn: str, secret_name: str, external_id: str) -> str:
+    creds_manager = CredentialsManager(role_arn, external_id=external_id)
     response = creds_manager.get_secret(secret_name)
     return response
 
@@ -71,8 +74,8 @@ def get_flight_search_credentials(client_id: str, client_secret: str):
         print(f"Error: {response.status_code} - {response.text}")
         return None
 
-def get_credentials(role_arn: str, secret_name: str) -> str:
-    creds_manager = CredentialsManager(role_arn)
+def get_credentials(role_arn: str, secret_name: str, external_id: str) -> str:
+    creds_manager = CredentialsManager(role_arn, external_id=external_id)
     api_keys = creds_manager.get_secret(secret_name)
     return api_keys
 
@@ -379,10 +382,11 @@ Provide a helpful and friendly response."""
 if __name__=='__main__':
 
     user_query = "Provide hotel and flight recommendations in Donegal, Ireland."
-    role_arn, secret_name = load_credentials()
+    role_arn, secret_name, external_id = load_credentials()
     os.environ["AWS_ROLE_ARN"] = role_arn
     os.environ["SECRET_NAME"] = secret_name
-    api_keys = get_credentials(role_arn, secret_name) 
+    os.environ["EXTERNAL_ID"] = external_id
+    api_keys = get_credentials(role_arn, secret_name, external_id) 
     os.environ["XAI_API_KEY"] = api_keys[0]
     amadeus_access_key = api_keys[1]
     amadeus_secret_key = api_keys[2]

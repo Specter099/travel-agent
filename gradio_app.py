@@ -7,12 +7,12 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 # Initialize credentials
 def setup_credentials():
-    credentials = load_credentials()
-    if credentials:
-        os.environ["AWS_ROLE_ARN"] = credentials[0]
-    
-    role_arn = os.environ.get("AWS_ROLE_ARN")
-    api_keys = get_credentials(role_arn, "api_keys")
+    role_arn, secret_name, external_id = load_credentials()
+    os.environ["AWS_ROLE_ARN"] = role_arn
+    os.environ["SECRET_NAME"] = secret_name
+    os.environ["EXTERNAL_ID"] = external_id
+
+    api_keys = get_credentials(role_arn, secret_name, external_id)
     os.environ["XAI_API_KEY"] = api_keys[0]
     os.environ["AMADEUS_API_KEY"] = api_keys[1]
     os.environ["AMADEUS_API_SECRET"] = api_keys[2]
