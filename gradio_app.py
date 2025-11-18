@@ -4,6 +4,7 @@ import time
 import threading
 from agents import AgentWorkflow, load_credentials, get_credentials, get_flight_search_credentials
 from langchain_core.messages import HumanMessage, AIMessage
+from input_validator import InputValidator, InputValidationError
 
 # Initialize credentials
 def setup_credentials():
@@ -27,6 +28,22 @@ workflow_lock = threading.Lock()  # Ensure thread-safe access to workflow
 
 def travel_agent_chat(message, history, origin, destination, max_price):
     if not message.strip():
+        yield history, ""
+        return
+
+    # Validate inputs before processing
+    try:
+        validated_inputs = InputValidator.validate_user_query(message)
+        if origin:
+            origin = InputValidator.validate_location(origin)
+        if destination:
+            destination = InputValidator.validate_location(destination)
+        if max_price:
+            max_price = InputValidator.validate_price(max_price)
+    except InputValidationError as e:
+        # Return error message to user
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": f"⚠️ Input validation error: {str(e)}\n\nPlease rephrase your query and try again."})
         yield history, ""
         return
 

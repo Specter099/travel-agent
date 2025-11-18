@@ -10,6 +10,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict, Optional, Annotated
 from operator import add
 import requests
+from input_validator import InputValidator, InputValidationError
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def load_credentials():
     load_dotenv()
@@ -124,8 +130,21 @@ class AgentWorkflow:
 
     def entry_node(self, state: AgentState):
         user_query = state["user_query"]
+
+        # Validate user input
+        try:
+            user_query = InputValidator.validate_user_query(user_query)
+        except InputValidationError as e:
+            logger.warning(f"Input validation failed: {e}")
+            # Return error state
+            return {
+                "web_search_agent_response": f"Error: {str(e)}",
+                "should_recommend_hotels": False,
+                "should_recommend_flights": False
+            }
+
         llm = self.create_grok_llm(streaming=False)
-        
+
         # Create prompt to extract flight details
         prompt = f"""Extract flight details from the following query. If any detail is not present, return None.
         Query: {user_query}
@@ -194,8 +213,20 @@ user_query: {user_query}
         return {"should_recommend_hotels": response}
 
     def web_search_node(self, state: AgentState):
+        user_query = state["user_query"]
+
+        # Validate query (should already be validated, but double-check)
+        try:
+            user_query = InputValidator.validate_user_query(user_query)
+        except InputValidationError as e:
+            logger.error(f"Invalid query in web_search_node: {e}")
+            return {
+                "web_search_agent_response": f"Error: {str(e)}",
+                "messages": [AIMessage(content=f"Error: {str(e)}")]
+            }
+
         # Perform web search first
-        search_results = web_search(state["user_query"])
+        search_results = web_search(user_query)
 
         # Create streaming LLM
         llm = self.create_grok_llm(streaming=True)
@@ -216,7 +247,7 @@ user_query: {user_query}
                 history_context += f"{role}: {msg.content}\n"
 
         # Create prompt with search results
-        prompt = f"""Based on the following search results, provide hotel recommendations for the user's query: {state["user_query"]}
+        prompt = f"""Based on the following search results, provide hotel recommendations for the user's query: {user_query}
 {history_context}
 
 Search Results:
@@ -243,9 +274,27 @@ Please provide a helpful response with specific hotel recommendations."""
         }
 
     def flight_search_node(self, state: AgentState):
+        user_query = state.get("user_query")
         flight_origin = state.get('flight_origin')
         flight_destination = state.get('flight_destination')
         flight_max_price = state.get('flight_max_price', 1000)
+
+        # Validate inputs
+        try:
+            if user_query:
+                user_query = InputValidator.validate_user_query(user_query)
+            if flight_origin:
+                flight_origin = InputValidator.validate_location(flight_origin)
+            if flight_destination:
+                flight_destination = InputValidator.validate_location(flight_destination)
+            if flight_max_price:
+                flight_max_price = InputValidator.validate_price(flight_max_price)
+        except InputValidationError as e:
+            logger.error(f"Invalid input in flight_search_node: {e}")
+            return {
+                "flight_search_agent_response": f"Error: {str(e)}",
+                "messages": [AIMessage(content=f"Error: {str(e)}")]
+            }
 
         # Create streaming LLM
         llm = self.create_grok_llm(streaming=True)
@@ -267,7 +316,7 @@ Please provide a helpful response with specific hotel recommendations."""
             print(f"[DEBUG] flight_search_node: Built history context with {len(messages[:-1])} messages")
 
         # Provide general flight advice
-        prompt = f"""Provide flight recommendations for the user's query: {state["user_query"]}
+        prompt = f"""Provide flight recommendations for the user's query: {user_query}
 {history_context}
 
 Origin: {flight_origin if flight_origin else 'Not specified'}
@@ -296,6 +345,18 @@ Since specific flight data is not available, provide general flight booking advi
         }  
       
     def conversational_node(self, state: AgentState):
+        user_query = state.get("user_query")
+
+        # Validate query
+        try:
+            user_query = InputValidator.validate_user_query(user_query)
+        except InputValidationError as e:
+            logger.error(f"Invalid query in conversational_node: {e}")
+            return {
+                "web_search_agent_response": f"Error: {str(e)}",
+                "messages": [AIMessage(content=f"Error: {str(e)}")]
+            }
+
         llm = self.create_grok_llm(streaming=True)
         messages = state.get("messages", [])
         print(f"[DEBUG] conversational_node: Received {len(messages)} messages")
@@ -311,8 +372,8 @@ Since specific flight data is not available, provide general flight booking advi
             for msg in messages[:-1]:
                 role = "User" if isinstance(msg, HumanMessage) else "Assistant"
                 history_context += f"{role}: {msg.content}\n"
-        
-        prompt = f"""You are a helpful travel agent. Answer the user's query: {state["user_query"]}
+
+        prompt = f"""You are a helpful travel agent. Answer the user's query: {user_query}
 {history_context}
 
 Provide a helpful and friendly response."""
