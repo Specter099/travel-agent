@@ -200,9 +200,15 @@ user_query: {user_query}
         # Build context from messages
         history_context = ""
         messages = state.get("messages", [])
+        print(f"[DEBUG] web_search_node: Received {len(messages)} messages")
+        for i, msg in enumerate(messages):
+            msg_type = type(msg).__name__
+            preview = msg.content[:50]
+            print(f"[DEBUG]   web_search_node Message[{i}]: {msg_type}: {preview}...")
         if len(messages) > 1:
             history_context = "\n\nPrevious conversation:\n"
-            for msg in messages[-4:]:
+            # Include all messages except the current one (last message)
+            for msg in messages[:-1]:
                 role = "User" if isinstance(msg, HumanMessage) else "Assistant"
                 history_context += f"{role}: {msg.content}\n"
 
@@ -220,8 +226,13 @@ Please provide a helpful response with specific hotel recommendations."""
 
         # Only add message if flights won't be searched (flight_search_agent will add combined message)
         messages_to_add = []
-        if not state.get("should_recommend_flights"):
+        should_rec_flights = state.get("should_recommend_flights")
+        print(f"[DEBUG] web_search_node: should_recommend_flights={should_rec_flights}")
+        if not should_rec_flights:
             messages_to_add = [AIMessage(content=full_response)]
+            print(f"[DEBUG] web_search_node: Adding AI message to history")
+        else:
+            print(f"[DEBUG] web_search_node: NOT adding AI message (flight search will combine)")
 
         return {
             "web_search_agent_response": full_response,
@@ -239,11 +250,18 @@ Please provide a helpful response with specific hotel recommendations."""
         # Build context from messages
         history_context = ""
         messages = state.get("messages", [])
+        print(f"[DEBUG] flight_search_node: Received {len(messages)} messages")
+        for i, msg in enumerate(messages):
+            msg_type = type(msg).__name__
+            preview = msg.content[:50]
+            print(f"[DEBUG]   flight_search_node Message[{i}]: {msg_type}: {preview}...")
         if len(messages) > 1:
             history_context = "\n\nPrevious conversation:\n"
-            for msg in messages[-4:]:
+            # Include all messages except the current one (last message)
+            for msg in messages[:-1]:
                 role = "User" if isinstance(msg, HumanMessage) else "Assistant"
                 history_context += f"{role}: {msg.content}\n"
+            print(f"[DEBUG] flight_search_node: Built history context with {len(messages[:-1])} messages")
 
         # Provide general flight advice
         prompt = f"""Provide flight recommendations for the user's query: {state["user_query"]}
@@ -277,11 +295,17 @@ Since specific flight data is not available, provide general flight booking advi
     def conversational_node(self, state: AgentState):
         llm = self.create_grok_llm(streaming=True)
         messages = state.get("messages", [])
-        
+        print(f"[DEBUG] conversational_node: Received {len(messages)} messages")
+        for i, msg in enumerate(messages):
+            msg_type = type(msg).__name__
+            preview = msg.content[:50]
+            print(f"[DEBUG]   conversational_node Message[{i}]: {msg_type}: {preview}...")
+
         history_context = ""
         if len(messages) > 1:
             history_context = "\n\nPrevious conversation:\n"
-            for msg in messages[-4:]:
+            # Include all messages except the current one (last message)
+            for msg in messages[:-1]:
                 role = "User" if isinstance(msg, HumanMessage) else "Assistant"
                 history_context += f"{role}: {msg.content}\n"
         
