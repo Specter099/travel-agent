@@ -23,6 +23,7 @@ def setup_credentials():
 # Initialize workflow
 setup_credentials()
 workflow = AgentWorkflow("grok-4-fast")
+workflow_lock = threading.Lock()  # Ensure thread-safe access to workflow
 
 def travel_agent_chat(message, history, origin, destination, max_price):
     if not message.strip():
@@ -31,6 +32,18 @@ def travel_agent_chat(message, history, origin, destination, max_price):
 
     # Add user message to history
     history.append({"role": "user", "content": message})
+
+    # Debug: Check current state before running workflow
+    config = {"configurable": {"thread_id": "gradio_session"}}
+    existing_state = workflow.workflow.get_state(config)
+    existing_messages = existing_state.values.get("messages", []) if existing_state.values else []
+    print(f"[DEBUG] Before workflow: {len(existing_messages)} existing messages in checkpoint")
+    # Show ALL messages with their actual indices
+    for i in range(len(existing_messages)):
+        msg = existing_messages[i]
+        msg_type = type(msg).__name__
+        content_preview = msg.content[:40] if len(msg.content) > 40 else msg.content
+        print(f"[DEBUG]   Message[{i}]: {msg_type}: {content_preview}...")
 
     # Build state from inputs
     # Note: messages uses the 'add' operator, so we only pass the new message
@@ -47,6 +60,8 @@ def travel_agent_chat(message, history, origin, destination, max_price):
         "web_search_agent_response": None,
         "flight_search_agent_response": None
     }
+
+    print(f"[DEBUG] Sending new user message: '{message}'")
 
     # Debug: Show what flight details were captured
     if origin or destination:
@@ -75,10 +90,24 @@ def travel_agent_chat(message, history, origin, destination, max_price):
     # Run workflow in background thread
     def run_workflow():
         try:
-            for event in workflow.run_streaming(state, thread_id="gradio_session"):
-                pass  # Just consume events
+            with workflow_lock:
+                for event in workflow.run_streaming(state, thread_id="gradio_session"):
+                    # Debug: Log message count
+                    msg_count = len(event.get('messages', []))
+                    print(f"[DEBUG] Event has {msg_count} messages")
         finally:
             workflow_done["done"] = True
+            # Debug: Check final state
+            config = {"configurable": {"thread_id": "gradio_session"}}
+            final_state = workflow.workflow.get_state(config)
+            final_messages = final_state.values.get("messages", []) if final_state.values else []
+            print(f"[DEBUG] Final state has {len(final_messages)} messages")
+            # Show ALL messages with their actual indices
+            for i in range(len(final_messages)):
+                msg = final_messages[i]
+                msg_type = type(msg).__name__
+                content_preview = msg.content[:60] if len(msg.content) > 60 else msg.content
+                print(f"[DEBUG]   Message[{i}]: {msg_type}: {content_preview}...")
 
     workflow_thread = threading.Thread(target=run_workflow)
     workflow_thread.start()
