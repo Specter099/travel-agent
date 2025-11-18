@@ -95,6 +95,7 @@ class AgentWorkflow:
         self.model = model
         self.memory = MemorySaver()
         self.workflow = self.create_workflow()
+        self.streaming_callback = None  # Callback for streaming tokens
 
     def create_grok_llm(self, streaming=None):
         return ChatOpenAI(
@@ -104,14 +105,17 @@ class AgentWorkflow:
             streaming=streaming
         )
     
-    def stream_response(self, llm: ChatOpenAI, prompt: str) -> str:
+    def stream_response(self, llm: ChatOpenAI, prompt: str, response_type: str = "") -> str:
         # Stream the response
         response_chunks = []
         for chunk in llm.stream(prompt):
             if chunk.content:
                 print(chunk.content, end="", flush=True)
                 response_chunks.append(chunk.content)
-        
+                # Call streaming callback if set (for Gradio updates)
+                if self.streaming_callback:
+                    self.streaming_callback("".join(response_chunks), response_type)
+
         full_response = "".join(response_chunks)
         return full_response
 
@@ -212,7 +216,7 @@ Search Results:
 Please provide a helpful response with specific hotel recommendations."""
 
         # Stream the response
-        full_response = self.stream_response(llm, prompt)
+        full_response = self.stream_response(llm, prompt, "hotel")
 
         # Only add message if flights won't be searched (flight_search_agent will add combined message)
         messages_to_add = []
@@ -256,7 +260,7 @@ Since specific flight data is not available, provide general flight booking advi
 - Airport recommendations"""
 
         # Stream the response
-        full_response = self.stream_response(llm, prompt)
+        full_response = self.stream_response(llm, prompt, "flight")
 
         # Build combined response if web search was executed
         combined_response = full_response
@@ -286,7 +290,7 @@ Since specific flight data is not available, provide general flight booking advi
 
 Provide a helpful and friendly response."""
 
-        full_response = self.stream_response(llm, prompt)
+        full_response = self.stream_response(llm, prompt, "conversational")
 
         # Return only the new message - LangGraph will append it with the 'add' operator
         return {
@@ -343,9 +347,10 @@ Provide a helpful and friendly response."""
         return result
     
     def run_streaming(self, state: AgentState, thread_id: str = "default"):
+        """Stream workflow execution and yield intermediate states"""
         config = {"configurable": {"thread_id": thread_id}}
-        result = self.workflow.invoke(state, config)
-        return result
+        for event in self.workflow.stream(state, config, stream_mode="values"):
+            yield event
     
 if __name__=='__main__':
 
