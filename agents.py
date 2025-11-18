@@ -71,13 +71,21 @@ def get_flight_search_credentials(client_id: str, client_secret: str):
         "client_id": client_id,
         "client_secret": client_secret
     }
-    response = requests.post(url, headers=headers, data=data)
-    
-    if response.status_code == 200:
-        token_data = response.json()
-        return token_data["access_token"]
-    else:
-        print(f"Error: {response.status_code} - {response.text}")
+
+    try:
+        response = requests.post(url, headers=headers, data=data, timeout=30)
+
+        if response.status_code == 200:
+            token_data = response.json()
+            return token_data["access_token"]
+        else:
+            logger.error(f"Amadeus token request failed: {response.status_code} - {response.text}")
+            return None
+    except requests.exceptions.Timeout:
+        logger.error("Amadeus token request timed out after 30 seconds")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Amadeus token request failed: {str(e)}")
         return None
 
 def get_credentials(role_arn: str, secret_name: str, external_id: str) -> str:
@@ -89,13 +97,20 @@ def get_flight_destinations(access_token: str, origin: str, max_price: int = 200
     url = "https://test.api.amadeus.com/v1/shopping/flight-destinations"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"origin": origin, "maxPrice": max_price}
-    
-    response = requests.get(url, headers=headers, params=params)
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"Error: {response.status_code} - {response.text}")
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"Amadeus flight destinations request failed: {response.status_code} - {response.text}")
+            return None
+    except requests.exceptions.Timeout:
+        logger.error("Amadeus flight destinations request timed out after 30 seconds")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Amadeus flight destinations request failed: {str(e)}")
         return None
     
 class AgentWorkflow:
@@ -119,13 +134,13 @@ class AgentWorkflow:
         response_chunks = []
         for chunk in llm.stream(prompt):
             if chunk.content:
-                print(chunk.content, end="", flush=True)
                 response_chunks.append(chunk.content)
                 # Call streaming callback if set (for Gradio updates)
                 if self.streaming_callback:
                     self.streaming_callback("".join(response_chunks), response_type)
 
         full_response = "".join(response_chunks)
+        logger.debug(f"Completed streaming response for type '{response_type}' ({len(full_response)} chars)")
         return full_response
 
     def entry_node(self, state: AgentState):
@@ -234,11 +249,7 @@ user_query: {user_query}
         # Build context from messages
         history_context = ""
         messages = state.get("messages", [])
-        print(f"[DEBUG] web_search_node: Received {len(messages)} messages")
-        for i, msg in enumerate(messages):
-            msg_type = type(msg).__name__
-            preview = msg.content[:50]
-            print(f"[DEBUG]   web_search_node Message[{i}]: {msg_type}: {preview}...")
+        logger.debug(f"web_search_node: Received {len(messages)} messages")
         if len(messages) > 1:
             history_context = "\n\nPrevious conversation:\n"
             # Include all messages except the current one (last message)
@@ -261,12 +272,12 @@ Please provide a helpful response with specific hotel recommendations."""
         # Only add message if flights won't be searched (flight_search_agent will add combined message)
         messages_to_add = []
         should_rec_flights = state.get("should_recommend_flights")
-        print(f"[DEBUG] web_search_node: should_recommend_flights={should_rec_flights}")
+        logger.debug(f"web_search_node: should_recommend_flights={should_rec_flights}")
         if not should_rec_flights:
             messages_to_add = [AIMessage(content=full_response)]
-            print(f"[DEBUG] web_search_node: Adding AI message to history")
+            logger.debug("web_search_node: Adding AI message to history")
         else:
-            print(f"[DEBUG] web_search_node: NOT adding AI message (flight search will combine)")
+            logger.debug("web_search_node: NOT adding AI message (flight search will combine)")
 
         return {
             "web_search_agent_response": full_response,
@@ -302,18 +313,14 @@ Please provide a helpful response with specific hotel recommendations."""
         # Build context from messages
         history_context = ""
         messages = state.get("messages", [])
-        print(f"[DEBUG] flight_search_node: Received {len(messages)} messages")
-        for i, msg in enumerate(messages):
-            msg_type = type(msg).__name__
-            preview = msg.content[:50]
-            print(f"[DEBUG]   flight_search_node Message[{i}]: {msg_type}: {preview}...")
+        logger.debug(f"flight_search_node: Received {len(messages)} messages")
         if len(messages) > 1:
             history_context = "\n\nPrevious conversation:\n"
             # Include all messages except the current one (last message)
             for msg in messages[:-1]:
                 role = "User" if isinstance(msg, HumanMessage) else "Assistant"
                 history_context += f"{role}: {msg.content}\n"
-            print(f"[DEBUG] flight_search_node: Built history context with {len(messages[:-1])} messages")
+            logger.debug(f"flight_search_node: Built history context with {len(messages[:-1])} messages")
 
         # Provide general flight advice
         prompt = f"""Provide flight recommendations for the user's query: {user_query}
@@ -359,11 +366,7 @@ Since specific flight data is not available, provide general flight booking advi
 
         llm = self.create_grok_llm(streaming=True)
         messages = state.get("messages", [])
-        print(f"[DEBUG] conversational_node: Received {len(messages)} messages")
-        for i, msg in enumerate(messages):
-            msg_type = type(msg).__name__
-            preview = msg.content[:50]
-            print(f"[DEBUG]   conversational_node Message[{i}]: {msg_type}: {preview}...")
+        logger.debug(f"conversational_node: Received {len(messages)} messages")
 
         history_context = ""
         if len(messages) > 1:

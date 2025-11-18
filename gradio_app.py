@@ -2,9 +2,14 @@ import gradio as gr
 import os
 import time
 import threading
+import logging
 from agents import AgentWorkflow, load_credentials, get_credentials, get_flight_search_credentials
 from langchain_core.messages import HumanMessage, AIMessage
 from input_validator import InputValidator, InputValidationError
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize credentials
 def setup_credentials():
@@ -50,17 +55,11 @@ def travel_agent_chat(message, history, origin, destination, max_price):
     # Add user message to history
     history.append({"role": "user", "content": message})
 
-    # Debug: Check current state before running workflow
+    # Check current state before running workflow
     config = {"configurable": {"thread_id": "gradio_session"}}
     existing_state = workflow.workflow.get_state(config)
     existing_messages = existing_state.values.get("messages", []) if existing_state.values else []
-    print(f"[DEBUG] Before workflow: {len(existing_messages)} existing messages in checkpoint")
-    # Show ALL messages with their actual indices
-    for i in range(len(existing_messages)):
-        msg = existing_messages[i]
-        msg_type = type(msg).__name__
-        content_preview = msg.content[:40] if len(msg.content) > 40 else msg.content
-        print(f"[DEBUG]   Message[{i}]: {msg_type}: {content_preview}...")
+    logger.debug(f"Before workflow: {len(existing_messages)} existing messages in checkpoint")
 
     # Build state from inputs
     # Note: messages uses the 'add' operator, so we only pass the new message
@@ -78,11 +77,11 @@ def travel_agent_chat(message, history, origin, destination, max_price):
         "flight_search_agent_response": None
     }
 
-    print(f"[DEBUG] Sending new user message: '{message}'")
+    logger.info(f"Processing query: '{message[:50]}{'...' if len(message) > 50 else ''}'")
 
-    # Debug: Show what flight details were captured
+    # Log flight details if captured
     if origin or destination:
-        print(f"Flight details captured - Origin: {origin}, Destination: {destination}, Max Price: {max_price}")
+        logger.info(f"Flight details - Origin: {origin}, Destination: {destination}, Max Price: {max_price}")
 
     # Track current responses
     hotel_response = {"content": ""}
@@ -110,22 +109,16 @@ def travel_agent_chat(message, history, origin, destination, max_price):
         try:
             with workflow_lock:
                 for event in workflow.run_streaming(state, thread_id="gradio_session"):
-                    # Debug: Log message count
                     msg_count = len(event.get('messages', []))
-                    print(f"[DEBUG] Event has {msg_count} messages")
+                    logger.debug(f"Event has {msg_count} messages")
+        except Exception as e:
+            logger.error(f"Workflow execution error: {str(e)}", exc_info=True)
         finally:
             workflow_done["done"] = True
-            # Debug: Check final state
             config = {"configurable": {"thread_id": "gradio_session"}}
             final_state = workflow.workflow.get_state(config)
             final_messages = final_state.values.get("messages", []) if final_state.values else []
-            print(f"[DEBUG] Final state has {len(final_messages)} messages")
-            # Show ALL messages with their actual indices
-            for i in range(len(final_messages)):
-                msg = final_messages[i]
-                msg_type = type(msg).__name__
-                content_preview = msg.content[:60] if len(msg.content) > 60 else msg.content
-                print(f"[DEBUG]   Message[{i}]: {msg_type}: {content_preview}...")
+            logger.debug(f"Final state has {len(final_messages)} messages")
 
     workflow_thread = threading.Thread(target=run_workflow)
     workflow_thread.start()
@@ -173,8 +166,8 @@ def travel_agent_chat(message, history, origin, destination, max_price):
     yield history, ""
 
 # Create Gradio interface
-with gr.Blocks(title="Travel Agent Assistant") as demo:
-    gr.Markdown("# 🌍 Travel Agent Assistant")
+with gr.Blocks(title="Travel AI Agent") as demo:
+    gr.Markdown("# 🌍 Travel AI Agent")
     gr.Markdown("Get personalized hotel and flight recommendations for your next trip!")
     
     with gr.Row():

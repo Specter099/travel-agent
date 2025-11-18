@@ -1,4 +1,4 @@
-# 🌍 Travel Agent Assistant
+# 🌍 Travel AI Agent
 
 An AI-powered travel agent that provides personalized hotel and flight recommendations using LangGraph workflows and a Gradio web interface. Built with security-first principles and enterprise-grade credential management.
 
