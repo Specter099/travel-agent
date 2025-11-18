@@ -1,5 +1,4 @@
 from langchain_openai import ChatOpenAI
-from langchain.agents import create_agent
 from ddgs import DDGS
 from dotenv import load_dotenv
 import os
@@ -190,10 +189,10 @@ user_query: {user_query}
     def web_search_node(self, state: AgentState):
         # Perform web search first
         search_results = web_search(state["user_query"])
-        
+
         # Create streaming LLM
         llm = self.create_grok_llm(streaming=True)
-        
+
         # Build context from messages
         history_context = ""
         messages = state.get("messages", [])
@@ -202,21 +201,27 @@ user_query: {user_query}
             for msg in messages[-4:]:
                 role = "User" if isinstance(msg, HumanMessage) else "Assistant"
                 history_context += f"{role}: {msg.content}\n"
-        
+
         # Create prompt with search results
         prompt = f"""Based on the following search results, provide hotel recommendations for the user's query: {state["user_query"]}
 {history_context}
-        
+
 Search Results:
 {search_results}
-        
+
 Please provide a helpful response with specific hotel recommendations."""
-        
+
         # Stream the response
         full_response = self.stream_response(llm, prompt)
-        
+
+        # Only add message if flights won't be searched (flight_search_agent will add combined message)
+        messages_to_add = []
+        if not state.get("should_recommend_flights"):
+            messages_to_add = [AIMessage(content=full_response)]
+
         return {
-            "web_search_agent_response": full_response
+            "web_search_agent_response": full_response,
+            "messages": messages_to_add
         }
 
     def flight_search_node(self, state: AgentState):
@@ -239,9 +244,9 @@ Please provide a helpful response with specific hotel recommendations."""
         # Provide general flight advice
         prompt = f"""Provide flight recommendations for the user's query: {state["user_query"]}
 {history_context}
-        
+
 Origin: {flight_origin if flight_origin else 'Not specified'}
-Destination: {flight_destination if flight_destination else 'Not specified'} 
+Destination: {flight_destination if flight_destination else 'Not specified'}
 Max Price: {flight_max_price}
 
 Since specific flight data is not available, provide general flight booking advice including:
@@ -252,13 +257,17 @@ Since specific flight data is not available, provide general flight booking advi
 
         # Stream the response
         full_response = self.stream_response(llm, prompt)
-        
-        # Append AI response to messages
-        new_messages = messages + [AIMessage(content=full_response)]
-        
+
+        # Build combined response if web search was executed
+        combined_response = full_response
+        web_search_response = state.get("web_search_agent_response")
+        if web_search_response:
+            combined_response = f"🏨 **Hotel Recommendations:**\n{web_search_response}\n\n✈️ **Flight Information:**\n{full_response}"
+
+        # Return only the new message - LangGraph will append it with the 'add' operator
         return {
             "flight_search_agent_response": full_response,
-            "messages": new_messages
+            "messages": [AIMessage(content=combined_response)]
         }  
       
     def conversational_node(self, state: AgentState):
@@ -276,13 +285,13 @@ Since specific flight data is not available, provide general flight booking advi
 {history_context}
 
 Provide a helpful and friendly response."""
-        
+
         full_response = self.stream_response(llm, prompt)
-        new_messages = messages + [AIMessage(content=full_response)]
-        
+
+        # Return only the new message - LangGraph will append it with the 'add' operator
         return {
             "web_search_agent_response": full_response,
-            "messages": new_messages
+            "messages": [AIMessage(content=full_response)]
         }
 
     def route_after_entry(self, state: AgentState):

@@ -1,7 +1,7 @@
 import gradio as gr
 import os
 import time
-from agents import AgentWorkflow, load_credentials, get_credentials, get_amadeus_credentials, get_flight_search_credentials
+from agents import AgentWorkflow, load_credentials, get_credentials, get_flight_search_credentials
 from langchain_core.messages import HumanMessage, AIMessage
 
 # Initialize credentials
@@ -30,20 +30,14 @@ def travel_agent_chat(message, history, origin, destination, max_price):
     
     # Add user message to history
     history.append({"role": "user", "content": message})
-    history.append({"role": "assistant", "content": ""})
-    
-    # Get existing conversation state from checkpointer
-    config = {"configurable": {"thread_id": "gradio_session"}}
-    existing_state = workflow.workflow.get_state(config)
-    existing_messages = existing_state.values.get("messages", []) if existing_state.values else []
-    
-    # Append new user message
-    new_messages = existing_messages + [HumanMessage(content=message)]
+    #history.append({"role": "assistant", "content": ""})
     
     # Build state from inputs
+    # Note: messages uses the 'add' operator, so we only pass the new message
+    # LangGraph will automatically append it to the existing messages in the checkpoint
     state = {
         "user_query": message,
-        "messages": new_messages,
+        "messages": [HumanMessage(content=message)],
         "flight_origin": origin.strip() if origin else None,
         "flight_destination": destination.strip() if destination else None,
         "flight_max_price": float(max_price) if max_price else 1000,
