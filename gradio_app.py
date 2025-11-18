@@ -70,6 +70,7 @@ def travel_agent_chat(message, history, origin, destination, max_price):
     # Track current responses
     hotel_response = {"content": ""}
     flight_response = {"content": ""}
+    conversational_response = {"content": ""}
     workflow_done = {"done": False}
 
     # Setup streaming callback to capture LLM tokens
@@ -79,7 +80,7 @@ def travel_agent_chat(message, history, origin, destination, max_price):
         elif response_type == "flight":
             flight_response["content"] = partial_response
         elif response_type == "conversational":
-            hotel_response["content"] = partial_response  # Reuse for simple responses
+            conversational_response["content"] = partial_response
 
     workflow.streaming_callback = streaming_callback
 
@@ -116,24 +117,34 @@ def travel_agent_chat(message, history, origin, destination, max_price):
     try:
         last_hotel = ""
         last_flight = ""
+        last_conversational = ""
 
-        while not workflow_done["done"] or hotel_response["content"] != last_hotel or flight_response["content"] != last_flight:
+        while not workflow_done["done"] or hotel_response["content"] != last_hotel or flight_response["content"] != last_flight or conversational_response["content"] != last_conversational:
             current_hotel = hotel_response["content"]
             current_flight = flight_response["content"]
+            current_conversational = conversational_response["content"]
 
             # Update UI if content changed
-            if current_hotel != last_hotel or current_flight != last_flight:
-                if current_flight:
+            if current_hotel != last_hotel or current_flight != last_flight or current_conversational != last_conversational:
+                # Determine what type of response we have
+                if current_conversational:
+                    # Simple conversational response (no hotel/flight)
+                    history[-1]["content"] = current_conversational
+                elif current_flight:
                     if current_hotel:
+                        # Both hotel and flight
                         history[-1]["content"] = f"🏨 **Hotel Recommendations:**\n{current_hotel}\n\n✈️ **Flight Information:**\n{current_flight}"
                     else:
+                        # Flight only
                         history[-1]["content"] = f"✈️ **Flight Information:**\n{current_flight}"
                 elif current_hotel:
+                    # Hotel only
                     history[-1]["content"] = f"🏨 **Hotel Recommendations:**\n{current_hotel}"
 
                 yield history, ""
                 last_hotel = current_hotel
                 last_flight = current_flight
+                last_conversational = current_conversational
 
             time.sleep(0.1)  # Check for updates every 100ms
 
