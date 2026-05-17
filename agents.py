@@ -1,44 +1,44 @@
-from langchain_openai import ChatOpenAI
-from ddgs import DDGS
-from dotenv import load_dotenv
-import os
-from pydantic import BaseModel
-from langchain_core.messages import HumanMessage, AIMessage
-from credentials import CredentialsManager
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-from typing import TypedDict, Optional, Annotated
-from operator import add
-import requests
-from input_validator import InputValidator, InputValidationError
-import logging
+"""Travel-agent LangGraph workflow.
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+Secrets are passed in via the AgentWorkflow constructor rather than read from
+os.environ, so they cannot leak into child processes. The Amadeus OAuth token
+is refreshed lazily when it nears expiry.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from datetime import datetime, timedelta, timezone
+from operator import add
+from typing import Annotated, Optional, TypedDict
+
+import requests
+from ddgs import DDGS
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
+
+from input_validator import InputValidationError, InputValidator
+
 logger = logging.getLogger(__name__)
 
-def load_credentials():
-    load_dotenv()
+_AMADEUS_TOKEN_URL = "https://test.api.amadeus.com/v1/security/oauth2/token"
+_AMADEUS_FLIGHT_DESTINATIONS_URL = (
+    "https://test.api.amadeus.com/v1/shopping/flight-destinations"
+)
+_HTTP_TIMEOUT_SECONDS = 30
+_TOKEN_REFRESH_LEEWAY = timedelta(seconds=60)
 
-    # Get configuration from environment variables
-    role_arn = os.getenv("AWS_ROLE_ARN")
-    secret_name = os.getenv("SECRET_NAME")
-    external_id = os.getenv("EXTERNAL_ID")
 
-    # Validate required environment variables
-    if not role_arn:
-        raise ValueError("AWS_ROLE_ARN environment variable is required")
-    if not secret_name:
-        raise ValueError("SECRET_NAME environment variable is required")
-    if not external_id:
-        raise ValueError("EXTERNAL_ID environment variable is required")
-    return role_arn, secret_name, external_id
-
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     user_query: str
     should_recommend_hotels: bool
-    web_search_agent_response: Optional[str]
     should_recommend_flights: bool
+    web_search_agent_response: Optional[str]
     flight_search_agent_response: Optional[str]
     flight_origin: Optional[str]
     flight_destination: Optional[str]
@@ -47,416 +47,408 @@ class AgentState(TypedDict):
     flight_arrival_date: Optional[str]
     messages: Annotated[list, add]
 
-class AgentResponseFormat(BaseModel):
-    response: str
+
+class FlightExtraction(BaseModel):
+    """Structured extraction from a free-form user query."""
+
+    flight_origin: Optional[str] = Field(
+        None, description="IATA airport code or city name"
+    )
+    flight_destination: Optional[str] = Field(
+        None, description="IATA airport code or city name"
+    )
+    flight_max_price: Optional[float] = Field(None, description="Maximum price in USD")
+    flight_departure_date: Optional[str] = Field(None, description="YYYY-MM-DD")
+    flight_arrival_date: Optional[str] = Field(None, description="YYYY-MM-DD")
+    should_recommend_flights: bool = False
+    should_recommend_hotels: bool = False
+
 
 def web_search(query: str, max_results: int = 5) -> str:
-    """Search the web for information using DuckDuckGo."""
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
-            results.append(f"{r['title']}: {r['body']} (URL: {r['href']})")
-    return "\n".join(results)
+    """Search the web for information using DuckDuckGo.
 
-def get_amadeus_credentials(role_arn: str, secret_name: str, external_id: str) -> str:
-    creds_manager = CredentialsManager(role_arn, external_id=external_id)
-    response = creds_manager.get_secret(secret_name)
-    return response
-
-def get_flight_search_credentials(client_id: str, client_secret: str):
-    url = "https://test.api.amadeus.com/v1/security/oauth2/token"
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret
-    }
-
+    Returns an empty string on failure so the workflow degrades gracefully
+    instead of aborting the whole conversation when DDG rate-limits.
+    """
     try:
-        response = requests.post(url, headers=headers, data=data, timeout=30)
+        with DDGS() as ddgs:
+            results = [
+                f"{r['title']}: {r['body']} (URL: {r['href']})"
+                for r in ddgs.text(query, max_results=max_results)
+            ]
+        return "\n".join(results)
+    except Exception as exc:
+        logger.warning("Web search failed for query %r: %s", query[:80], exc)
+        return ""
 
-        if response.status_code == 200:
-            token_data = response.json()
-            return token_data["access_token"]
-        else:
-            logger.error(f"Amadeus token request failed: {response.status_code} - {response.text}")
+
+class AmadeusClient:
+    """Holds Amadeus client credentials and lazily refreshes the OAuth token."""
+
+    def __init__(self, client_id: str, client_secret: str):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._token: Optional[str] = None
+        self._expires_at: Optional[datetime] = None
+        self._lock = threading.Lock()
+
+    def _token_valid(self) -> bool:
+        return bool(
+            self._token
+            and self._expires_at
+            and datetime.now(timezone.utc) < self._expires_at - _TOKEN_REFRESH_LEEWAY
+        )
+
+    def access_token(self) -> Optional[str]:
+        with self._lock:
+            if self._token_valid():
+                return self._token
+            try:
+                response = requests.post(
+                    _AMADEUS_TOKEN_URL,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                    },
+                    timeout=_HTTP_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                self._token = payload["access_token"]
+                self._expires_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=int(payload.get("expires_in", 1800))
+                )
+                logger.info(
+                    "Refreshed Amadeus OAuth token (expires %s)", self._expires_at
+                )
+                return self._token
+            except Exception as exc:  # noqa: BLE001 — any failure must clear token state
+                logger.error("Amadeus token request failed: %s", exc)
+                self._token = None
+                self._expires_at = None
+                return None
+
+    def flight_destinations(self, origin: str, max_price: int = 200) -> Optional[dict]:
+        token = self.access_token()
+        if not token:
             return None
-    except requests.exceptions.Timeout:
-        logger.error("Amadeus token request timed out after 30 seconds")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Amadeus token request failed: {str(e)}")
-        return None
-
-def get_credentials(role_arn: str, secret_name: str, external_id: str) -> str:
-    creds_manager = CredentialsManager(role_arn, external_id=external_id)
-    api_keys = creds_manager.get_secret(secret_name)
-    return api_keys
-
-def get_flight_destinations(access_token: str, origin: str, max_price: int = 200):
-    url = "https://test.api.amadeus.com/v1/shopping/flight-destinations"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"origin": origin, "maxPrice": max_price}
-
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=30)
-
-        if response.status_code == 200:
+        try:
+            response = requests.get(
+                _AMADEUS_FLIGHT_DESTINATIONS_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                params={"origin": origin, "maxPrice": max_price},
+                timeout=_HTTP_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
             return response.json()
-        else:
-            logger.error(f"Amadeus flight destinations request failed: {response.status_code} - {response.text}")
+        except requests.RequestException as exc:
+            logger.error("Amadeus flight destinations request failed: %s", exc)
             return None
-    except requests.exceptions.Timeout:
-        logger.error("Amadeus flight destinations request timed out after 30 seconds")
+
+
+def _format_history(messages: list) -> str:
+    """Render prior turns as a readable transcript, excluding the current one."""
+    if len(messages) <= 1:
+        return ""
+    lines = []
+    for msg in messages[:-1]:
+        role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+        lines.append(f"{role}: {msg.content}")
+    return "\n\nPrevious conversation:\n" + "\n".join(lines)
+
+
+def _streaming_callback_from_config(config: Optional[RunnableConfig]):
+    if not config:
         return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Amadeus flight destinations request failed: {str(e)}")
-        return None
-    
+    return config.get("configurable", {}).get("streaming_callback")
+
+
 class AgentWorkflow:
+    """LangGraph workflow that routes between hotel search, flight info, and chat."""
 
-    def __init__(self, model: str):
+    def __init__(
+        self,
+        model: str,
+        xai_api_key: str,
+        amadeus: Optional[AmadeusClient] = None,
+    ):
+        if not xai_api_key:
+            raise ValueError("xai_api_key is required")
         self.model = model
+        self._xai_api_key = xai_api_key
+        self.amadeus = amadeus
         self.memory = MemorySaver()
-        self.workflow = self.create_workflow()
-        self.streaming_callback = None  # Callback for streaming tokens
+        self.workflow = self._build_graph()
 
-    def create_grok_llm(self, streaming=None):
+    def _llm(self, streaming: bool = False) -> ChatOpenAI:
         return ChatOpenAI(
             model=self.model,
-            api_key=os.environ["XAI_API_KEY"],
+            api_key=self._xai_api_key,
             base_url="https://api.x.ai/v1",
-            streaming=streaming
+            streaming=streaming,
         )
-    
-    def stream_response(self, llm: ChatOpenAI, prompt: str, response_type: str = "") -> str:
-        # Stream the response
-        response_chunks = []
+
+    def _stream(
+        self,
+        llm: ChatOpenAI,
+        prompt: str,
+        response_type: str,
+        callback,
+    ) -> str:
+        chunks: list[str] = []
         for chunk in llm.stream(prompt):
             if chunk.content:
-                response_chunks.append(chunk.content)
-                # Call streaming callback if set (for Gradio updates)
-                if self.streaming_callback:
-                    self.streaming_callback("".join(response_chunks), response_type)
+                chunks.append(chunk.content)
+                if callback:
+                    try:
+                        callback("".join(chunks), response_type)
+                    except Exception as exc:  # noqa: BLE001 — callback is user-supplied
+                        logger.warning("Streaming callback raised: %s", exc)
+        return "".join(chunks)
 
-        full_response = "".join(response_chunks)
-        logger.debug(f"Completed streaming response for type '{response_type}' ({len(full_response)} chars)")
-        return full_response
-
-    def entry_node(self, state: AgentState):
-        user_query = state["user_query"]
-
-        # Validate user input
+    def entry_node(self, state: AgentState) -> dict:
         try:
-            user_query = InputValidator.validate_user_query(user_query)
-        except InputValidationError as e:
-            logger.warning(f"Input validation failed: {e}")
-            # Return error state
+            user_query = InputValidator.validate_user_query(state["user_query"])
+        except InputValidationError as exc:
+            logger.warning("Input validation failed: %s", exc)
             return {
-                "web_search_agent_response": f"Error: {str(e)}",
+                "web_search_agent_response": f"Error: {exc}",
                 "should_recommend_hotels": False,
-                "should_recommend_flights": False
+                "should_recommend_flights": False,
             }
 
-        llm = self.create_grok_llm(streaming=False)
+        llm = self._llm(streaming=False).with_structured_output(FlightExtraction)
+        prompt = (
+            "Extract flight intent and details from the user's travel query. "
+            "Set should_recommend_flights/hotels based on whether the user is asking for them. "
+            "Leave fields as null if not mentioned.\n\n"
+            f"Query: {user_query}"
+        )
 
-        # Create prompt to extract flight details
-        prompt = f"""Extract flight details from the following query. If any detail is not present, return None.
-        Query: {user_query}
-        
-        Required format:
-        Origin: <origin airport code or None>
-        Destination: <destination airport code or None> 
-        Max Price: <maximum price as float or None>
-        Departure Date: <YYYY-MM-DD or None>
-        Arrival Date: <YYYY-MM-DD or None>
-        Should recommend flights: <True or False>
-        Should recommend hotels: <True or False>"""
-
-        # Get structured response from LLM
-        response = llm.invoke([HumanMessage(content=prompt)])
-        
-        # Parse response and update state
-        lines = response.content.strip().split('\n')
-        extracted = {}
-        for line in lines:
-            if ':' in line:
-                key, value = line.split(':', 1)
-                value = value.strip()
-                extracted[key.strip().lower().replace(' ', '_')] = None if value == 'None' else value
-
-        # Safely convert max_price to float with error handling
-        max_price = None
-        if extracted.get('max_price'):
-            try:
-                max_price = float(extracted['max_price'])
-            except (ValueError, TypeError):
-                max_price = None
+        try:
+            extraction: FlightExtraction = llm.invoke([HumanMessage(content=prompt)])
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Structured extraction failed, falling back to defaults: %s", exc
+            )
+            extraction = FlightExtraction()
 
         return {
-            "flight_origin": extracted.get('origin'),
-            "flight_destination": extracted.get('destination'),
-            "flight_max_price": max_price,
-            "flight_departure_date": extracted.get('departure_date'),
-            "flight_arrival_date": extracted.get('arrival_date'),
-            "should_recommend_flights": extracted.get('should_recommend_flights') == 'True',
-            "should_recommend_hotels": extracted.get('should_recommend_hotels') == 'True'
+            "user_query": user_query,
+            "flight_origin": extraction.flight_origin,
+            "flight_destination": extraction.flight_destination,
+            "flight_max_price": extraction.flight_max_price,
+            "flight_departure_date": extraction.flight_departure_date,
+            "flight_arrival_date": extraction.flight_arrival_date,
+            "should_recommend_flights": extraction.should_recommend_flights,
+            "should_recommend_hotels": extraction.should_recommend_hotels,
         }
 
-    def flight_recommendations_node(self, state: AgentState):
-        user_query = state["user_query"]
-        
-        # Check if flight details are provided in the state or if query mentions flights
-        has_flight_details = bool(state.get("flight_origin") or state.get("flight_destination"))
-        query_mentions_flights = "flight" in user_query.lower() or "fly" in user_query.lower()
-        
-        needs_flights = has_flight_details or query_mentions_flights
-        return {"flight_recommendations": needs_flights}
-
-    def should_recommend_hotels_node(self, state: AgentState):
-        user_query = state.get("user_query")
-        llm = self.create_grok_llm(streaming=False)
-        prompt = f"""You are a helpful travel agent.  Determine if the user is asking for hotel recommendations.  ***Respond with only True or False***.
-
-user_query: {user_query}
-"""
-        should_recommend_hotels_response = llm.invoke([HumanMessage(content=prompt)]).content.lower()
-        if should_recommend_hotels_response == "true":
-            response = True
-        if should_recommend_hotels_response == "false":
-            response = False
-        return {"should_recommend_hotels": response}
-
-    def web_search_node(self, state: AgentState):
-        user_query = state["user_query"]
-
-        # Validate query (should already be validated, but double-check)
+    def web_search_node(self, state: AgentState, config: RunnableConfig) -> dict:
         try:
-            user_query = InputValidator.validate_user_query(user_query)
-        except InputValidationError as e:
-            logger.error(f"Invalid query in web_search_node: {e}")
+            user_query = InputValidator.validate_user_query(state["user_query"])
+        except InputValidationError as exc:
             return {
-                "web_search_agent_response": f"Error: {str(e)}",
-                "messages": [AIMessage(content=f"Error: {str(e)}")]
+                "web_search_agent_response": f"Error: {exc}",
+                "messages": [AIMessage(content=f"Error: {exc}")],
             }
 
-        # Perform web search first
         search_results = web_search(user_query)
+        history = _format_history(state.get("messages", []))
+        prompt = (
+            f"Based on the following search results, provide hotel recommendations "
+            f"for the user's query: {user_query}{history}\n\n"
+            f"Search Results:\n{search_results or '(no search results available)'}\n\n"
+            "Please provide a helpful response with specific hotel recommendations."
+        )
 
-        # Create streaming LLM
-        llm = self.create_grok_llm(streaming=True)
+        full_response = self._stream(
+            self._llm(streaming=True),
+            prompt,
+            "hotel",
+            _streaming_callback_from_config(config),
+        )
 
-        # Build context from messages
-        history_context = ""
-        messages = state.get("messages", [])
-        logger.debug(f"web_search_node: Received {len(messages)} messages")
-        if len(messages) > 1:
-            history_context = "\n\nPrevious conversation:\n"
-            # Include all messages except the current one (last message)
-            for msg in messages[:-1]:
-                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-                history_context += f"{role}: {msg.content}\n"
-
-        # Create prompt with search results
-        prompt = f"""Based on the following search results, provide hotel recommendations for the user's query: {user_query}
-{history_context}
-
-Search Results:
-{search_results}
-
-Please provide a helpful response with specific hotel recommendations."""
-
-        # Stream the response
-        full_response = self.stream_response(llm, prompt, "hotel")
-
-        # Only add message if flights won't be searched (flight_search_agent will add combined message)
-        messages_to_add = []
-        should_rec_flights = state.get("should_recommend_flights")
-        logger.debug(f"web_search_node: should_recommend_flights={should_rec_flights}")
-        if not should_rec_flights:
+        # The flight node will combine messages if flights are also requested.
+        messages_to_add: list = []
+        if not state.get("should_recommend_flights"):
             messages_to_add = [AIMessage(content=full_response)]
-            logger.debug("web_search_node: Adding AI message to history")
-        else:
-            logger.debug("web_search_node: NOT adding AI message (flight search will combine)")
 
         return {
             "web_search_agent_response": full_response,
-            "messages": messages_to_add
+            "messages": messages_to_add,
         }
 
-    def flight_search_node(self, state: AgentState):
-        user_query = state.get("user_query")
-        flight_origin = state.get('flight_origin')
-        flight_destination = state.get('flight_destination')
-        flight_max_price = state.get('flight_max_price', 1000)
-
-        # Validate inputs
+    def flight_search_node(self, state: AgentState, config: RunnableConfig) -> dict:
         try:
-            if user_query:
-                user_query = InputValidator.validate_user_query(user_query)
-            if flight_origin:
-                flight_origin = InputValidator.validate_location(flight_origin)
-            if flight_destination:
-                flight_destination = InputValidator.validate_location(flight_destination)
-            if flight_max_price:
-                flight_max_price = InputValidator.validate_price(flight_max_price)
-        except InputValidationError as e:
-            logger.error(f"Invalid input in flight_search_node: {e}")
+            user_query = (
+                InputValidator.validate_user_query(state["user_query"])
+                if state.get("user_query")
+                else None
+            )
+            origin = InputValidator.validate_location(state.get("flight_origin"))
+            destination = InputValidator.validate_location(
+                state.get("flight_destination")
+            )
+            max_price = InputValidator.validate_price(state.get("flight_max_price"))
+        except InputValidationError as exc:
             return {
-                "flight_search_agent_response": f"Error: {str(e)}",
-                "messages": [AIMessage(content=f"Error: {str(e)}")]
+                "flight_search_agent_response": f"Error: {exc}",
+                "messages": [AIMessage(content=f"Error: {exc}")],
             }
 
-        # Create streaming LLM
-        llm = self.create_grok_llm(streaming=True)
+        history = _format_history(state.get("messages", []))
+        prompt = (
+            f"Provide flight recommendations for the user's query: {user_query}{history}\n\n"
+            f"Origin: {origin or 'Not specified'}\n"
+            f"Destination: {destination or 'Not specified'}\n"
+            f"Max Price: {max_price if max_price is not None else 'Not specified'}\n\n"
+            "Since specific flight data is not available, provide general flight booking advice including:\n"
+            "- Major airlines that serve the destination\n"
+            "- Typical flight routes and connections\n"
+            "- Best booking practices and timing\n"
+            "- Airport recommendations"
+        )
 
-        # Build context from messages
-        history_context = ""
-        messages = state.get("messages", [])
-        logger.debug(f"flight_search_node: Received {len(messages)} messages")
-        if len(messages) > 1:
-            history_context = "\n\nPrevious conversation:\n"
-            # Include all messages except the current one (last message)
-            for msg in messages[:-1]:
-                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-                history_context += f"{role}: {msg.content}\n"
-            logger.debug(f"flight_search_node: Built history context with {len(messages[:-1])} messages")
+        full_response = self._stream(
+            self._llm(streaming=True),
+            prompt,
+            "flight",
+            _streaming_callback_from_config(config),
+        )
 
-        # Provide general flight advice
-        prompt = f"""Provide flight recommendations for the user's query: {user_query}
-{history_context}
-
-Origin: {flight_origin if flight_origin else 'Not specified'}
-Destination: {flight_destination if flight_destination else 'Not specified'}
-Max Price: {flight_max_price}
-
-Since specific flight data is not available, provide general flight booking advice including:
-- Major airlines that serve the destination
-- Typical flight routes and connections
-- Best booking practices and timing
-- Airport recommendations"""
-
-        # Stream the response
-        full_response = self.stream_response(llm, prompt, "flight")
-
-        # Build combined response if web search was executed
-        combined_response = full_response
         web_search_response = state.get("web_search_agent_response")
-        if web_search_response:
-            combined_response = f"🏨 **Hotel Recommendations:**\n{web_search_response}\n\n✈️ **Flight Information:**\n{full_response}"
+        combined = (
+            f"\U0001f3e8 **Hotel Recommendations:**\n{web_search_response}\n\n"
+            f"✈️ **Flight Information:**\n{full_response}"
+            if web_search_response
+            else full_response
+        )
 
-        # Return only the new message - LangGraph will append it with the 'add' operator
         return {
             "flight_search_agent_response": full_response,
-            "messages": [AIMessage(content=combined_response)]
-        }  
-      
-    def conversational_node(self, state: AgentState):
-        user_query = state.get("user_query")
-
-        # Validate query
-        try:
-            user_query = InputValidator.validate_user_query(user_query)
-        except InputValidationError as e:
-            logger.error(f"Invalid query in conversational_node: {e}")
-            return {
-                "web_search_agent_response": f"Error: {str(e)}",
-                "messages": [AIMessage(content=f"Error: {str(e)}")]
-            }
-
-        llm = self.create_grok_llm(streaming=True)
-        messages = state.get("messages", [])
-        logger.debug(f"conversational_node: Received {len(messages)} messages")
-
-        history_context = ""
-        if len(messages) > 1:
-            history_context = "\n\nPrevious conversation:\n"
-            # Include all messages except the current one (last message)
-            for msg in messages[:-1]:
-                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-                history_context += f"{role}: {msg.content}\n"
-
-        prompt = f"""You are a helpful travel agent. Answer the user's query: {user_query}
-{history_context}
-
-Provide a helpful and friendly response."""
-
-        full_response = self.stream_response(llm, prompt, "conversational")
-
-        # Return only the new message - LangGraph will append it with the 'add' operator
-        return {
-            "web_search_agent_response": full_response,
-            "messages": [AIMessage(content=full_response)]
+            "messages": [AIMessage(content=combined)],
         }
 
-    def route_after_entry(self, state: AgentState):
+    def conversational_node(self, state: AgentState, config: RunnableConfig) -> dict:
+        try:
+            user_query = InputValidator.validate_user_query(state["user_query"])
+        except InputValidationError as exc:
+            return {
+                "web_search_agent_response": f"Error: {exc}",
+                "messages": [AIMessage(content=f"Error: {exc}")],
+            }
+
+        history = _format_history(state.get("messages", []))
+        prompt = (
+            f"You are a helpful travel agent. Answer the user's query: {user_query}{history}\n\n"
+            "Provide a helpful and friendly response."
+        )
+
+        full_response = self._stream(
+            self._llm(streaming=True),
+            prompt,
+            "conversational",
+            _streaming_callback_from_config(config),
+        )
+
+        return {
+            "web_search_agent_response": full_response,
+            "messages": [AIMessage(content=full_response)],
+        }
+
+    def _route_after_entry(self, state: AgentState) -> str:
         if state.get("should_recommend_hotels"):
             return "web_search_agent"
-        elif state.get("should_recommend_flights"):
-            return "flight_search_agent"
-        else:
-            return "conversational_node"
-
-    def route_after_hotels(self, state: AgentState):
         if state.get("should_recommend_flights"):
             return "flight_search_agent"
-        else:
-            return END
+        return "conversational_node"
 
-    def create_workflow(self):
+    def _route_after_hotels(self, state: AgentState):
+        if state.get("should_recommend_flights"):
+            return "flight_search_agent"
+        return END
+
+    def _build_graph(self):
         workflow = StateGraph(AgentState)
         workflow.add_node("entry_node", self.entry_node)
         workflow.add_node("web_search_agent", self.web_search_node)
         workflow.add_node("flight_search_agent", self.flight_search_node)
         workflow.add_node("conversational_node", self.conversational_node)
-    
+
         workflow.add_edge(START, "entry_node")
         workflow.add_conditional_edges(
             "entry_node",
-            self.route_after_entry,
+            self._route_after_entry,
             {
                 "web_search_agent": "web_search_agent",
                 "flight_search_agent": "flight_search_agent",
-                "conversational_node": "conversational_node"
-            }
+                "conversational_node": "conversational_node",
+            },
         )
         workflow.add_conditional_edges(
             "web_search_agent",
-            self.route_after_hotels,
-            {
-                "flight_search_agent": "flight_search_agent",
-                END: END
-            }
+            self._route_after_hotels,
+            {"flight_search_agent": "flight_search_agent", END: END},
         )
         workflow.add_edge("flight_search_agent", END)
         workflow.add_edge("conversational_node", END)
         return workflow.compile(checkpointer=self.memory)
-    
-    def run(self, state: AgentState, thread_id: str = "default"):
-        config = {"configurable": {"thread_id": thread_id}}
-        result = self.workflow.invoke(state, config)
-        return result
-    
-    def run_streaming(self, state: AgentState, thread_id: str = "default"):
-        """Stream workflow execution and yield intermediate states"""
-        config = {"configurable": {"thread_id": thread_id}}
-        for event in self.workflow.stream(state, config, stream_mode="values"):
-            yield event
-    
-if __name__=='__main__':
 
-    user_query = "Provide hotel and flight recommendations in Donegal, Ireland."
-    role_arn, secret_name, external_id = load_credentials()
-    os.environ["AWS_ROLE_ARN"] = role_arn
-    os.environ["SECRET_NAME"] = secret_name
-    os.environ["EXTERNAL_ID"] = external_id
-    api_keys = get_credentials(role_arn, secret_name, external_id) 
-    os.environ["XAI_API_KEY"] = api_keys[0]
-    amadeus_access_key = api_keys[1]
-    amadeus_secret_key = api_keys[2]
-    os.environ["AMADEUS_ACCESS_KEY"] = amadeus_access_key
-    os.environ["AMADEUS_SECRET_KEY"] = amadeus_secret_key
-    
-    workflow = AgentWorkflow("grok-4-fast")
-    
-    result = workflow.run_streaming({"user_query": user_query})
+    def run(self, state: AgentState, thread_id: str = "default") -> dict:
+        return self.workflow.invoke(state, {"configurable": {"thread_id": thread_id}})
+
+    def run_streaming(
+        self,
+        state: AgentState,
+        thread_id: str = "default",
+        streaming_callback=None,
+    ):
+        """Stream workflow execution; yields intermediate states.
+
+        ``streaming_callback`` is plumbed through the LangGraph RunnableConfig
+        so each invocation gets its own callback — no instance-level state to
+        leak between concurrent requests.
+        """
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "streaming_callback": streaming_callback,
+            }
+        }
+        yield from self.workflow.stream(state, config, stream_mode="values")
+
+
+def build_workflow_from_env(model: str = "grok-4-fast") -> AgentWorkflow:
+    """Build a workflow using AWS-stored secrets. Used by the CLI/dev entrypoint."""
+    import os
+
+    from dotenv import load_dotenv
+
+    from credentials import CredentialsManager
+
+    load_dotenv()
+    role_arn = os.environ.get("AWS_ROLE_ARN")
+    secret_name = os.environ.get("SECRET_NAME")
+    external_id = os.environ.get("EXTERNAL_ID")
+    if not (role_arn and secret_name and external_id):
+        raise RuntimeError(
+            "AWS_ROLE_ARN, SECRET_NAME, and EXTERNAL_ID must be set in the environment"
+        )
+
+    creds = CredentialsManager(role_arn=role_arn, external_id=external_id).get_secret(
+        secret_name
+    )
+    amadeus = AmadeusClient(creds.amadeus_api_key, creds.amadeus_api_secret)
+    return AgentWorkflow(model=model, xai_api_key=creds.xai_api_key, amadeus=amadeus)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    workflow = build_workflow_from_env()
+    for event in workflow.run_streaming(
+        {"user_query": "Provide hotel and flight recommendations in Donegal, Ireland."}
+    ):
+        logger.info("event: %s", list(event.keys()))

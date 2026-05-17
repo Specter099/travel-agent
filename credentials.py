@@ -1,91 +1,121 @@
-import boto3
 import json
-from typing import Dict, Tuple, Optional
-from datetime import datetime, timedelta
 import logging
+from datetime import datetime, timedelta, timezone
+from typing import Dict, NamedTuple, Optional
 
-# Configure logging
+import boto3
+
 logger = logging.getLogger(__name__)
 
+
+# Refresh STS credentials this many seconds before their expiration.
+_STS_REFRESH_LEEWAY = timedelta(minutes=5)
+
+
+class APISecrets(NamedTuple):
+    xai_api_key: str
+    amadeus_api_key: str
+    amadeus_api_secret: str
+    langsmith_api_key: Optional[str]
+
+
 class CredentialsManager:
-    def __init__(self, role_arn: str, session_name: str = "agent-session", external_id: str = "ai-agent"):
+    """Assume a role, fetch secrets, and refresh both on expiry.
+
+    Why: previous version cached STS credentials forever, so anything running
+    longer than the role's session duration would hit ExpiredToken errors. We
+    also returned a positional tuple of secrets that was easy to misindex.
+    """
+
+    def __init__(
+        self,
+        role_arn: str,
+        external_id: str,
+        session_name: str = "travel-agent-session",
+        cache_ttl_minutes: int = 30,
+    ):
+        if not role_arn:
+            raise ValueError("role_arn is required")
+        if not external_id:
+            raise ValueError("external_id is required")
+
         self.role_arn = role_arn
-        self.session_name = session_name
-        self.credentials = None
         self.external_id = external_id
+        self.session_name = session_name
+        self.cache_ttl = timedelta(minutes=cache_ttl_minutes)
 
-        # Cache for secrets with expiration
-        self.secret_cache: Dict[str, Tuple] = {}  # {secret_name: (secret_value, expiry_time)}
-        self.cache_ttl_minutes = 30  # Cache secrets for 30 minutes
-    
-    def get_temporary_credentials(self) -> Dict:
-        sts = boto3.client('sts')
-        response = sts.assume_role(
-            RoleArn=self.role_arn,
-            RoleSessionName=self.session_name,
-            ExternalId=self.external_id
-        )
-        self.credentials = response['Credentials']
-        return self.credentials
-    
-    def get_secret(self, secret_name: str, region: str = 'us-east-1') -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-        # Check cache first
-        if secret_name in self.secret_cache:
-            cached_value, expiry_time = self.secret_cache[secret_name]
-            if datetime.now() < expiry_time:
-                logger.debug(f"Using cached secret for '{secret_name}'")
-                return cached_value
-            else:
-                logger.debug(f"Cache expired for '{secret_name}', refreshing...")
-                del self.secret_cache[secret_name]
+        self._credentials: Optional[Dict] = None
+        self._sts = boto3.client("sts")
+        self._secret_cache: Dict[str, tuple] = {}
 
-        # Get fresh credentials if needed
-        if not self.credentials:
-            self.get_temporary_credentials()
+    def _credentials_expired(self) -> bool:
+        if not self._credentials:
+            return True
+        expiry = self._credentials.get("Expiration")
+        if not expiry:
+            return True
+        return datetime.now(timezone.utc) >= expiry - _STS_REFRESH_LEEWAY
 
-        try:
-            client = boto3.client(
-                'secretsmanager',
-                region_name=region,
-                aws_access_key_id=self.credentials['AccessKeyId'],
-                aws_secret_access_key=self.credentials['SecretAccessKey'],
-                aws_session_token=self.credentials['SessionToken']
+    def _ensure_credentials(self) -> Dict:
+        if self._credentials_expired():
+            logger.info("Refreshing STS credentials via AssumeRole")
+            response = self._sts.assume_role(
+                RoleArn=self.role_arn,
+                RoleSessionName=self.session_name,
+                ExternalId=self.external_id,
             )
+            self._credentials = response["Credentials"]
+        return self._credentials
 
-            response = client.get_secret_value(SecretId=secret_name)
-            secret = json.loads(response['SecretString'])
-
-            # Extract and validate secrets
-            result = (
-                secret.get('x_api_key'),
-                secret.get('amadeus_api_key'),
-                secret.get('amadeus_api_secret'),
-                secret.get('langsmith_api_key')
-            )
-
-            # Validate that secrets are not empty
-            if not all(result):
-                logger.warning(f"Some secrets in '{secret_name}' are missing or empty")
-
-            # Cache the result
-            expiry_time = datetime.now() + timedelta(minutes=self.cache_ttl_minutes)
-            self.secret_cache[secret_name] = (result, expiry_time)
-            logger.info(f"Retrieved and cached secret '{secret_name}' (expires in {self.cache_ttl_minutes} minutes)")
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Failed to retrieve secret '{secret_name}': {str(e)}")
-            raise
-    
-    def create_bedrock_client(self, region: str = 'us-east-1'):
-        if not self.credentials:
-            self.get_temporary_credentials()
-        
+    def _secretsmanager_client(self, region: str):
+        creds = self._ensure_credentials()
         return boto3.client(
-            'bedrock-runtime',
+            "secretsmanager",
             region_name=region,
-            aws_access_key_id=self.credentials['AccessKeyId'],
-            aws_secret_access_key=self.credentials['SecretAccessKey'],
-            aws_session_token=self.credentials['SessionToken']
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+
+    def get_secret(self, secret_name: str, region: str = "us-east-1") -> APISecrets:
+        cached = self._secret_cache.get(secret_name)
+        if cached:
+            value, expiry = cached
+            if datetime.now(timezone.utc) < expiry:
+                return value
+            del self._secret_cache[secret_name]
+
+        client = self._secretsmanager_client(region)
+        response = client.get_secret_value(SecretId=secret_name)
+        secret = json.loads(response["SecretString"])
+
+        result = APISecrets(
+            xai_api_key=secret.get("x_api_key"),
+            amadeus_api_key=secret.get("amadeus_api_key"),
+            amadeus_api_secret=secret.get("amadeus_api_secret"),
+            langsmith_api_key=secret.get("langsmith_api_key"),
+        )
+
+        if not (
+            result.xai_api_key and result.amadeus_api_key and result.amadeus_api_secret
+        ):
+            raise ValueError(
+                f"Secret '{secret_name}' is missing one of: x_api_key, amadeus_api_key, amadeus_api_secret"
+            )
+
+        self._secret_cache[secret_name] = (
+            result,
+            datetime.now(timezone.utc) + self.cache_ttl,
+        )
+        logger.info("Cached secret '%s' for %s", secret_name, self.cache_ttl)
+        return result
+
+    def create_bedrock_client(self, region: str = "us-east-1"):
+        creds = self._ensure_credentials()
+        return boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
         )

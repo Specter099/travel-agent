@@ -2,17 +2,16 @@
 Input validation module to prevent prompt injection attacks and ensure data integrity.
 """
 
-import re
-from typing import Optional, List
 import logging
+import re
+from typing import Optional
 
-# Configure logging
-logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
 class InputValidationError(Exception):
     """Raised when input validation fails."""
+
     pass
 
 
@@ -61,8 +60,18 @@ class InputValidator:
     # Characters that could be used for injection
     SUSPICIOUS_CHARS = [
         "\x00",  # Null byte
-        "\x01", "\x02", "\x03", "\x04", "\x05", "\x06", "\x07",
-        "\x08", "\x0b", "\x0c", "\x0e", "\x0f",
+        "\x01",
+        "\x02",
+        "\x03",
+        "\x04",
+        "\x05",
+        "\x06",
+        "\x07",
+        "\x08",
+        "\x0b",
+        "\x0c",
+        "\x0e",
+        "\x0f",
     ]
 
     @classmethod
@@ -87,7 +96,9 @@ class InputValidator:
 
         # Check length
         if len(query) > cls.MAX_QUERY_LENGTH:
-            logger.warning(f"Query exceeds maximum length: {len(query)} > {cls.MAX_QUERY_LENGTH}")
+            logger.warning(
+                f"Query exceeds maximum length: {len(query)} > {cls.MAX_QUERY_LENGTH}"
+            )
             raise InputValidationError(
                 f"Query too long. Maximum {cls.MAX_QUERY_LENGTH} characters allowed."
             )
@@ -102,13 +113,17 @@ class InputValidator:
         query_lower = query.lower()
         for pattern in cls.INJECTION_PATTERNS:
             if re.search(pattern, query_lower, re.IGNORECASE):
-                logger.warning(f"Potential prompt injection detected: pattern '{pattern}' found in query")
+                logger.warning(
+                    f"Potential prompt injection detected: pattern '{pattern}' found in query"
+                )
                 raise InputValidationError(
                     "Invalid input detected. Please rephrase your query."
                 )
 
         # Check for excessive special character usage (potential obfuscation)
-        special_char_count = sum(1 for char in query if not char.isalnum() and not char.isspace())
+        special_char_count = sum(
+            1 for char in query if not char.isalnum() and not char.isspace()
+        )
         special_char_ratio = special_char_count / len(query)
         if special_char_ratio > 0.3:  # More than 30% special characters
             logger.warning(f"Excessive special characters: {special_char_ratio:.2%}")
@@ -118,7 +133,7 @@ class InputValidator:
 
         # Sanitize: strip whitespace and normalize spaces
         query = query.strip()
-        query = re.sub(r'\s+', ' ', query)
+        query = re.sub(r"\s+", " ", query)
 
         return query
 
@@ -152,7 +167,7 @@ class InputValidator:
         location = location.strip()
 
         # Location should only contain letters, numbers, spaces, hyphens, and commas
-        if not re.match(r'^[a-zA-Z0-9\s,\-]+$', location):
+        if not re.match(r"^[a-zA-Z0-9\s,\-]+$", location):
             raise InputValidationError(
                 "Location contains invalid characters. Use only letters, numbers, spaces, hyphens, and commas."
             )
@@ -182,7 +197,7 @@ class InputValidator:
             raise InputValidationError("Price must be a number")
 
         if price < cls.MIN_PRICE:
-            raise InputValidationError(f"Price cannot be negative")
+            raise InputValidationError("Price cannot be negative")
 
         if price > cls.MAX_PRICE:
             raise InputValidationError(
@@ -212,7 +227,7 @@ class InputValidator:
             raise InputValidationError("Date must be a string")
 
         # Basic YYYY-MM-DD format check
-        if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
             raise InputValidationError(
                 "Date must be in YYYY-MM-DD format (e.g., 2025-12-25)"
             )
@@ -239,7 +254,7 @@ class InputValidator:
             text = text[:max_length] + "..."
 
         # Remove control characters
-        text = ''.join(char for char in text if char.isprintable() or char in '\n\r\t')
+        text = "".join(char for char in text if char.isprintable() or char in "\n\r\t")
 
         return text
 
@@ -249,7 +264,7 @@ def validate_user_input(
     query: str,
     origin: Optional[str] = None,
     destination: Optional[str] = None,
-    max_price: Optional[float] = None
+    max_price: Optional[float] = None,
 ) -> dict:
     """
     Validate all user inputs at once.
