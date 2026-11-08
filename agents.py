@@ -2,7 +2,6 @@ from langchain_openai import ChatOpenAI
 from ddgs import DDGS
 from dotenv import load_dotenv
 import os
-from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage
 from credentials import CredentialsManager
 from langgraph.graph import StateGraph, START, END
@@ -46,9 +45,6 @@ class AgentState(TypedDict):
     flight_departure_date: Optional[str]
     flight_arrival_date: Optional[str]
     messages: Annotated[list, add]
-
-class AgentResponseFormat(BaseModel):
-    response: str
 
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web for information using DuckDuckGo."""
