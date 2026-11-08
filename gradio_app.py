@@ -4,7 +4,7 @@ import time
 import threading
 import logging
 from agents import AgentWorkflow, load_credentials, get_credentials, get_flight_search_credentials
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage
 from input_validator import InputValidator, InputValidationError
 
 # Configure logging
@@ -38,7 +38,7 @@ def travel_agent_chat(message, history, origin, destination, max_price):
 
     # Validate inputs before processing
     try:
-        validated_inputs = InputValidator.validate_user_query(message)
+        InputValidator.validate_user_query(message)
         if origin:
             origin = InputValidator.validate_location(origin)
         if destination:
