@@ -2,7 +2,6 @@ from langchain_openai import ChatOpenAI
 from ddgs import DDGS
 from dotenv import load_dotenv
 import os
-from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage
 from credentials import CredentialsManager
 from langgraph.graph import StateGraph, START, END
@@ -47,9 +46,6 @@ class AgentState(TypedDict):
     flight_arrival_date: Optional[str]
     messages: Annotated[list, add]
 
-class AgentResponseFormat(BaseModel):
-    response: str
-
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web for information using DuckDuckGo."""
     results = []
@@ -57,11 +53,6 @@ def web_search(query: str, max_results: int = 5) -> str:
         for r in ddgs.text(query, max_results=max_results):
             results.append(f"{r['title']}: {r['body']} (URL: {r['href']})")
     return "\n".join(results)
-
-def get_amadeus_credentials(role_arn: str, secret_name: str, external_id: str) -> str:
-    creds_manager = CredentialsManager(role_arn, external_id=external_id)
-    response = creds_manager.get_secret(secret_name)
-    return response
 
 def get_flight_search_credentials(client_id: str, client_secret: str):
     url = "https://test.api.amadeus.com/v1/security/oauth2/token"
@@ -93,26 +84,6 @@ def get_credentials(role_arn: str, secret_name: str, external_id: str) -> str:
     api_keys = creds_manager.get_secret(secret_name)
     return api_keys
 
-def get_flight_destinations(access_token: str, origin: str, max_price: int = 200):
-    url = "https://test.api.amadeus.com/v1/shopping/flight-destinations"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"origin": origin, "maxPrice": max_price}
-
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=30)
-
-        if response.status_code == 200:
-            return response.json()
-        else:
-            logger.error(f"Amadeus flight destinations request failed: {response.status_code} - {response.text}")
-            return None
-    except requests.exceptions.Timeout:
-        logger.error("Amadeus flight destinations request timed out after 30 seconds")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Amadeus flight destinations request failed: {str(e)}")
-        return None
-    
 class AgentWorkflow:
 
     def __init__(self, model: str):
@@ -202,30 +173,6 @@ class AgentWorkflow:
             "should_recommend_flights": extracted.get('should_recommend_flights') == 'True',
             "should_recommend_hotels": extracted.get('should_recommend_hotels') == 'True'
         }
-
-    def flight_recommendations_node(self, state: AgentState):
-        user_query = state["user_query"]
-        
-        # Check if flight details are provided in the state or if query mentions flights
-        has_flight_details = bool(state.get("flight_origin") or state.get("flight_destination"))
-        query_mentions_flights = "flight" in user_query.lower() or "fly" in user_query.lower()
-        
-        needs_flights = has_flight_details or query_mentions_flights
-        return {"flight_recommendations": needs_flights}
-
-    def should_recommend_hotels_node(self, state: AgentState):
-        user_query = state.get("user_query")
-        llm = self.create_grok_llm(streaming=False)
-        prompt = f"""You are a helpful travel agent.  Determine if the user is asking for hotel recommendations.  ***Respond with only True or False***.
-
-user_query: {user_query}
-"""
-        should_recommend_hotels_response = llm.invoke([HumanMessage(content=prompt)]).content.lower()
-        if should_recommend_hotels_response == "true":
-            response = True
-        if should_recommend_hotels_response == "false":
-            response = False
-        return {"should_recommend_hotels": response}
 
     def web_search_node(self, state: AgentState):
         user_query = state["user_query"]

@@ -3,7 +3,7 @@ Input validation module to prevent prompt injection attacks and ensure data inte
 """
 
 import re
-from typing import Optional, List
+from typing import Optional
 import logging
 
 # Configure logging
